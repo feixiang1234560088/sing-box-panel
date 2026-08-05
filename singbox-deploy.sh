@@ -10,6 +10,10 @@ set -o pipefail
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'
 BLUE='\033[0;36m'; BOLD='\033[1m'; NC='\033[0m'
 
+# GitHub 仓库 raw 地址（一键安装/更新用）
+# 可用环境变量覆盖： REPO_RAW=... bash singbox-deploy.sh
+REPO_RAW="${REPO_RAW:-https://raw.githubusercontent.com/feixiang1234560088/sing-box-panel/main}"
+
 SB_DIR="/usr/local/sing-box"
 SB_BIN="$SB_DIR/sing-box"
 SB_ETC="/etc/sing-box"
@@ -129,22 +133,53 @@ SELF_PATH="$SB_ETC/manage.sh"
 
 install_shortcut() {
     local src="${BASH_SOURCE[0]}"
-    [[ -f "$src" ]] || return 0
     mkdir -p "$SB_ETC"
-    if ! cmp -s "$src" "$SELF_PATH" 2>/dev/null; then
-        cp "$src" "$SELF_PATH"
-        chmod 700 "$SELF_PATH"
-    fi
-    # 同步面板文件（若与脚本同目录）
-    local pdir; pdir="$(cd "$(dirname "$src")" && pwd)"
-    [[ -f "$pdir/singbox-panel.py" && ! -f "$SB_ETC/panel.py" ]] && \
-        cp "$pdir/singbox-panel.py" "$SB_ETC/panel.py" && chmod 700 "$SB_ETC/panel.py"
 
+    # ① 脚本自身：本地文件则复制；管道运行(curl|bash)则从仓库下载
+    if [[ -f "$src" && "$src" != "/dev/"* ]]; then
+        cmp -s "$src" "$SELF_PATH" 2>/dev/null || { cp "$src" "$SELF_PATH"; chmod 700 "$SELF_PATH"; }
+    elif [[ ! -f "$SELF_PATH" && -n "$REPO_RAW" ]]; then
+        curl -fsSL "${REPO_RAW}/singbox-deploy.sh" -o "$SELF_PATH" && chmod 700 "$SELF_PATH"
+    fi
+
+    # ② 面板文件：优先同目录，其次仓库下载
+    if [[ ! -f "$SB_ETC/panel.py" ]]; then
+        local pdir=""
+        [[ -f "$src" && "$src" != "/dev/"* ]] && pdir="$(cd "$(dirname "$src")" 2>/dev/null && pwd)"
+        if [[ -n "$pdir" && -f "$pdir/singbox-panel.py" ]]; then
+            cp "$pdir/singbox-panel.py" "$SB_ETC/panel.py"
+        elif [[ -n "$REPO_RAW" ]]; then
+            info "下载面板文件"
+            curl -fsSL "${REPO_RAW}/singbox-panel.py" -o "$SB_ETC/panel.py" \
+                || warn "面板文件下载失败，可稍后在菜单重装面板"
+        fi
+        [[ -f "$SB_ETC/panel.py" ]] && chmod 700 "$SB_ETC/panel.py"
+    fi
+
+    [[ -f "$SELF_PATH" ]] || return 0
     cat > /usr/local/bin/s <<EOF
 #!/bin/bash
 exec bash "$SELF_PATH" "\$@"
 EOF
     chmod 755 /usr/local/bin/s
+}
+
+update_self() {
+    [[ -z "$REPO_RAW" ]] && { warn "未配置仓库地址 REPO_RAW"; return 1; }
+    title "更新脚本与面板"
+    local tmp; tmp=$(mktemp -d)
+    if curl -fsSL "${REPO_RAW}/singbox-deploy.sh" -o "$tmp/d.sh" \
+       && curl -fsSL "${REPO_RAW}/singbox-panel.py" -o "$tmp/p.py" \
+       && bash -n "$tmp/d.sh" && python3 -m py_compile "$tmp/p.py" 2>/dev/null; then
+        cp "$tmp/d.sh" "$SELF_PATH"; chmod 700 "$SELF_PATH"
+        cp "$tmp/p.py" "$SB_ETC/panel.py"; chmod 700 "$SB_ETC/panel.py"
+        systemctl restart singbox-panel 2>/dev/null
+        rm -rf "$tmp"
+        ok "已更新到最新版，请重新运行 s"
+        exit 0
+    fi
+    rm -rf "$tmp"
+    err "更新失败（下载不通或文件损坏）"
 }
 
 # ─────────────────────────────────────────────
@@ -538,12 +573,29 @@ panel_installed() { [[ -f "$PANEL_PY" ]]; }
 
 install_panel() {
     title "安装 Web 面板"
-    if [[ ! -f "$PANEL_PY" ]]; then
-        if [[ -f "$(dirname "$0")/singbox-panel.py" ]]; then
-            cp "$(dirname "$0")/singbox-panel.py" "$PANEL_PY"
+    if [[ ! -s "$PANEL_PY" ]]; then
+        local sdir=""
+        [[ -f "$0" && "$0" != "/dev/"* ]] && sdir="$(cd "$(dirname "$0")" 2>/dev/null && pwd)"
+        if [[ -n "$sdir" && -f "$sdir/singbox-panel.py" ]]; then
+            cp "$sdir/singbox-panel.py" "$PANEL_PY"
+            ok "已从本地目录复制面板文件"
+        elif [[ -n "$REPO_RAW" ]]; then
+            info "从仓库下载面板文件"
+            if curl -fsSL --max-time 60 "${REPO_RAW}/singbox-panel.py" -o "$PANEL_PY"; then
+                ok "面板文件已下载"
+            else
+                err "下载失败: ${REPO_RAW}/singbox-panel.py"
+                warn "请检查仓库是否公开、分支名是否正确(main/master)"
+                rm -f "$PANEL_PY"; return 1
+            fi
         else
-            err "找不到 singbox-panel.py，请与本脚本放在同一目录"; return 1
+            err "找不到 singbox-panel.py，且未配置 REPO_RAW"; return 1
         fi
+    fi
+    # 校验下载的文件是有效 Python
+    if ! python3 -m py_compile "$PANEL_PY" 2>/dev/null; then
+        err "面板文件损坏或不是有效的 Python 脚本"
+        rm -f "$PANEL_PY"; return 1
     fi
     chmod 700 "$PANEL_PY"
 
@@ -922,6 +974,7 @@ main_menu() {
   5) 版本管理 (升级 / 锁定)
   6) 重启 sing-box
   7) 查看日志
+  8) 更新脚本与面板 (从 GitHub)
   ─────────────────────────
   9) 完全卸载 sing-box
   0) 退出
@@ -935,6 +988,7 @@ EOF
             5) do_upgrade ;;
             6) systemctl restart sing-box && ok "已重启" ;;
             7) journalctl -u sing-box -n 50 --no-pager ;;
+            8) update_self ;;
             9) do_uninstall ;;
             0) exit 0 ;;
             *) err "无效选择" ;;

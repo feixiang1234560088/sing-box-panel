@@ -1165,7 +1165,11 @@ async function setPanelTls(d){
    <div class="acts">${d?`<button onclick="location.href='${r.url}'">前往新地址</button>`:''}
    <button class="btn2" onclick="closeM()">关闭</button></div>`;
   document.getElementById('modal').classList.add('show')}else msg(r.msg)}
-async function loadSub(){const r=await api('/sub');
+async function loadSub(){let r;
+ try{r=await api('/sub')}catch(e){
+   document.getElementById('subinfo').innerHTML=`<div class="alert">加载失败: ${esc(e.message||e)}</div>`;return}
+ if(!r||!r.url){document.getElementById('subinfo').innerHTML=
+   `<div class="alert">接口异常${r&&r.msg?': '+esc(r.msg):''}<div class="cmd">journalctl -u singbox-panel -n 30 --no-pager</div></div>`;return}
  document.getElementById('suburl').textContent=r.url;
  let h='';
  if(r.legacy)h+=`<div class="alert">⚠ 订阅服务仍在用旧版(http.server)，会导致订阅为空或被下载。<br>
@@ -1370,6 +1374,17 @@ class Handler(BaseHTTPRequestHandler):
         return None
 
     def do_GET(self):
+        try:
+            return self._do_GET()
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            try:
+                return self._send(500, {"ok": False, "msg": f"服务端错误: {e}"})
+            except Exception:
+                pass
+
+    def _do_GET(self):
         raw = urllib.parse.urlparse(self.path).path
         p = self._strip_base(raw)
         if p is None:
@@ -1432,7 +1447,7 @@ class Handler(BaseHTTPRequestHandler):
                     "domain": sdom,
                     "count": len(uris),
                     "names": [v.get("name", k) for k, v in m.items() if v.get("uri")],
-                    "running": svc.strip() == "active",
+                    "running": running,
                     "legacy": legacy,
                 })
             if p == "/api/logs":

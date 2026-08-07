@@ -910,6 +910,61 @@ def install_version(ver, job=None):
         sh(f"rm -rf {tmp}")
 
 
+AUTO_LOG = []          # 最近几次自动更新记录
+
+
+def auto_update_loop():
+    """按配置定期检查并自动升级 sing-box。默认关闭。"""
+    time.sleep(120)                      # 启动后先等 2 分钟
+    while True:
+        try:
+            pc = load_json(PANEL_CFG, {})
+            au = pc.get("auto_update") or {}
+            if not au.get("enabled"):
+                time.sleep(1800)
+                continue
+            hours = max(1, int(au.get("interval_hours", 12)))
+
+            # 版本锁定时不自动更新
+            if os.path.exists(VER_PIN):
+                AUTO_LOG.append({"t": time.strftime("%m-%d %H:%M"),
+                                 "msg": "已锁定版本，跳过"})
+                time.sleep(hours * 3600)
+                continue
+            if VER_JOB.get("running") or CERT_JOB.get("running"):
+                time.sleep(600)
+                continue
+
+            lst = fetch_versions()
+            if not lst:
+                time.sleep(hours * 3600)
+                continue
+            # stable = 只跟正式版；all = 含预发布
+            if au.get("channel", "stable") == "stable":
+                target = next((v["ver"] for v in lst if not v["pre"]), "")
+            else:
+                target = lst[0]["ver"]
+            cur = cur_version()
+            if not target or target == cur:
+                AUTO_LOG.append({"t": time.strftime("%m-%d %H:%M"),
+                                 "msg": f"已是最新 {cur}"})
+                time.sleep(hours * 3600)
+                continue
+
+            VER_JOB.update(running=True, ver=target, ok=None, msg="", step="自动更新")
+            okk, r = install_version(target, VER_JOB)
+            VER_JOB.update(running=False, ok=okk,
+                           msg=(f"已切换到 {r}" if okk else r), step="")
+            AUTO_LOG.append({"t": time.strftime("%m-%d %H:%M"),
+                             "msg": (f"自动升级 {cur} → {target} 成功" if okk
+                                     else f"自动升级到 {target} 失败(已回滚): {r[:120]}")})
+            del AUTO_LOG[:-10]
+            time.sleep(hours * 3600)
+        except Exception as e:
+            AUTO_LOG.append({"t": time.strftime("%m-%d %H:%M"), "msg": f"异常: {e}"})
+            time.sleep(3600)
+
+
 def install_version_async(ver):
     def work():
         VER_JOB.update(running=True, ver=ver, ok=None, msg="", step="准备")
@@ -1361,6 +1416,21 @@ async function loadVer(){const box=document.getElementById('verbox');
      <button class="btn2" onclick="manualVer()">安装其他版本</button>
    </div>
    <p style="color:#8b93a1;font-size:12px;margin-top:8px">锁定后切换版本会二次确认，防止误升级</p></div>
+  <div class="card"><h3>自动更新 ${r.auto&&r.auto.enabled?'<span class="badge" style="background:#1e3a2a;color:#8ff0b5">已开启</span>':'<span class="badge">已关闭</span>'}</h3>
+   <label class="chk" style="margin:6px 0"><input type="checkbox" id="au-on" ${r.auto&&r.auto.enabled?'checked':''}>
+     <span>发现新版本时自动升级 <i>失败会自动回滚</i></span></label>
+   <label>更新通道</label>
+   <select id="au-ch">
+     <option value="stable" ${(!r.auto||r.auto.channel==='stable')?'selected':''}>仅正式版（推荐，稳定）</option>
+     <option value="all" ${r.auto&&r.auto.channel==='all'?'selected':''}>含预发布 beta/alpha（尝鲜，有风险）</option>
+   </select>
+   <label>检查间隔（小时）</label>
+   <input id="au-iv" type="number" min="1" value="${(r.auto&&r.auto.interval_hours)||12}">
+   <div class="acts"><button onclick="saveAuto()">保存</button></div>
+   ${pin?`<p style="color:#f0c674;font-size:12px;margin-top:8px">⚠ 当前已锁定版本，自动更新不会执行</p>`:''}
+   ${(r.auto_log&&r.auto_log.length)?`<p style="color:#8b93a1;font-size:12px;margin-top:10px">最近记录：</p>
+     <div style="font-size:12px;color:#6b7280;line-height:1.8">${r.auto_log.slice().reverse().map(x=>`${x.t} · ${esc(x.msg)}`).join('<br>')}</div>`:''}
+  </div>
   <div class="card"><h3>最近版本 <span class="badge">最新 ${(r.list||[]).length} 个</span></h3>
    <div class="scanlist">${rows||'<div class="empty">获取失败，检查服务器能否访问 GitHub</div>'}</div>
    <p style="color:#8b93a1;font-size:12px;margin-top:8px">需要更早的版本请用「安装其他版本」手动输入</p></div>`}
@@ -1392,6 +1462,13 @@ function manualVer(){document.getElementById('mbox').innerHTML=`<h2>手动指定
  <div class="acts"><button onclick="(async()=>{const v=document.getElementById('mv').value.trim();if(!v)return;closeM();doInstall(v)})()">安装</button>
  <button class="btn2" onclick="closeM()">取消</button></div>`;
  document.getElementById('modal').classList.add('show')}
+async function saveAuto(){
+ const en=document.getElementById('au-on').checked;
+ const ch=document.getElementById('au-ch').value;
+ const iv=parseInt(document.getElementById('au-iv').value)||12;
+ if(en&&ch==='all'&&!confirm('含预发布通道会自动升到 beta/alpha 版本。\n\n预发布版可能引入不兼容变更，确定开启？'))return;
+ const r=await api('/auto-update','POST',{enabled:en,channel:ch,interval_hours:iv});
+ msg(r.msg,1);loadVer()}
 async function doClean(deep){
  if(deep&&!confirm('深度清理会清空 apt 缓存并压缩系统日志，确定？'))return;
  msg('清理中…',1);
@@ -1639,6 +1716,7 @@ class Handler(BaseHTTPRequestHandler):
                 pin = ""
                 if os.path.exists(VER_PIN):
                     pin = open(VER_PIN).read().strip()
+                au = pc0.get("auto_update") or {} if (pc0 := load_json(PANEL_CFG, {})) else {}
                 lst = fetch_versions()
                 cur = cur_version()
                 latest = lst[0]["ver"] if lst else ""
@@ -1648,6 +1726,10 @@ class Handler(BaseHTTPRequestHandler):
                     "latest": latest, "stable": stable,
                     "has_update": bool(latest and cur and latest != cur),
                     "note": lst[0]["note"] if lst else "",
+                    "auto": {"enabled": bool(au.get("enabled")),
+                             "channel": au.get("channel", "stable"),
+                             "interval_hours": int(au.get("interval_hours", 12))},
+                    "auto_log": AUTO_LOG[-5:],
                 })
         return self._send(404, {"ok": False})
 
@@ -1699,6 +1781,18 @@ class Handler(BaseHTTPRequestHandler):
                     return self._send(200, {"ok": False, "msg": "已有升级任务进行中"})
                 install_version_async(ver)
                 return self._send(200, {"ok": True, "async": True})
+            if p == "/api/auto-update":
+                pc = load_json(PANEL_CFG, {})
+                pc["auto_update"] = {
+                    "enabled": bool(b.get("enabled")),
+                    "channel": b.get("channel", "stable"),
+                    "interval_hours": max(1, int(b.get("interval_hours", 12))),
+                }
+                save_json(PANEL_CFG, pc)
+                st = "已开启" if pc["auto_update"]["enabled"] else "已关闭"
+                ch = "仅正式版" if pc["auto_update"]["channel"] == "stable" else "含预发布"
+                return self._send(200, {"ok": True,
+                                        "msg": f"自动更新{st}（{ch}，每 {pc['auto_update']['interval_hours']} 小时检查）"})
             if p == "/api/pin-version":
                 if b.get("pin"):
                     with open(VER_PIN, "w") as fh:
@@ -1816,6 +1910,7 @@ def main():
     os.makedirs(SUB_DIR, exist_ok=True)
     rebuild_sub()
     threading.Thread(target=janitor_loop, daemon=True).start()
+    threading.Thread(target=auto_update_loop, daemon=True).start()
 
     # 订阅服务与面板同进程（省一个 Python 解释器约 20MB）
     sub_port = int(pc.get("sub_port", 8080))

@@ -210,7 +210,8 @@ def issue_cert(domain):
                 sh(f"{envp} --install-cert -d {domain} {ecc} "
                    f"--fullchain-file {CERT_DIR}/{domain}/fullchain.pem "
                    f"--key-file {CERT_DIR}/{domain}/privkey.pem "
-                   f'--reloadcmd "systemctl restart sing-box; systemctl restart singbox-panel"', 60)
+                   f'--reloadcmd "systemctl restart sing-box; '
+       f'systemd-run --collect --on-active=2 --unit=sbpanel-reload systemctl restart singbox-panel"', 60)
                 if os.path.exists(f"{CERT_DIR}/{domain}/fullchain.pem"):
                     return True, "已复用本地现有证书（未消耗签发次数）"
 
@@ -254,11 +255,15 @@ def issue_cert(domain):
     sh(f"{envp} --install-cert -d {domain} --ecc "
        f"--fullchain-file {CERT_DIR}/{domain}/fullchain.pem "
        f"--key-file {CERT_DIR}/{domain}/privkey.pem "
-       f'--reloadcmd "systemctl restart sing-box; systemctl restart singbox-panel"', 60)
+       f'--reloadcmd "systemctl restart sing-box; '
+       f'systemd-run --collect --on-active=2 --unit=sbpanel-reload systemctl restart singbox-panel"', 60)
     sh("systemctl start sing-box")
 
     if not os.path.exists(f"{CERT_DIR}/{domain}/fullchain.pem"):
         return False, "证书已签发但安装失败，请查看 /root/.acme.sh 日志"
+    # 面板正用此域名时，安全地重启自己以加载新证书
+    if load_json(PANEL_CFG, {}).get("tls_domain") == domain:
+        safe_restart_self(3)
     return True, "证书申请成功"
 
 
@@ -346,6 +351,19 @@ def scan_dests(hosts=None):
     # 合格的按延迟升序在前，不合格的在后
     out.sort(key=lambda x: (not x["ok"], x["ms"] if x["ms"] >= 0 else 99999))
     return out
+
+
+def safe_restart_self(delay=1):
+    """重启面板自身。必须脱离自己的 cgroup，否则会被一起杀掉导致服务停摆。"""
+    c, _, _ = sh("command -v systemd-run")
+    if c == 0:
+        sh(f"systemd-run --collect --on-active={delay} "
+           f"--unit=sbpanel-restart-{secrets.token_hex(3)} "
+           f"systemctl restart singbox-panel", 10)
+    else:
+        # 兜底：用 setsid + nohup 脱离进程组
+        sh(f"setsid nohup sh -c 'sleep {delay}; systemctl restart singbox-panel' "
+           f">/dev/null 2>&1 &", 5)
 
 
 def apply_config(new_cfg):
@@ -1542,8 +1560,8 @@ class Handler(BaseHTTPRequestHandler):
                 url = (f"https://{dom}:{port}{pth}" if dom
                        else f"http://127.0.0.1:{port}{pth}")
                 hint = "" if dom else "  (需 SSH 隧道)"
-                # 延迟重启，先把响应发出去
-                threading.Timer(1.0, lambda: sh("systemctl restart singbox-panel")).start()
+                # 延迟重启（脱离自身 cgroup，否则服务会停摆）
+                safe_restart_self(2)
                 sp = pc.get("sub_port", 8080)
                 suburl = (f"https://{dom}:{sp}/{sub_token()}" if dom
                           else f"http://{public_ip()}:{sp}/{sub_token()}")

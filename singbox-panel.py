@@ -353,6 +353,67 @@ def scan_dests(hosts=None):
     return out
 
 
+def cleanup_disk(deep=False):
+    """清理残留临时文件与旧备份。deep=True 时连 apt 缓存/日志一起清。"""
+    freed = []
+    d = os.path.dirname(SB_BIN)
+    # 1) 本程序产生的临时目录（含旧版遗留在 /tmp 的）
+    for pat in (f"{d}/.up-*", "/tmp/sbup-*", "/var/tmp/sbup-*"):
+        c, o, _ = sh(f"du -scm {pat} 2>/dev/null | tail -1 | awk '{{print $1}}'")
+        try:
+            mb = int(o.strip())
+        except ValueError:
+            mb = 0
+        if mb > 0:
+            sh(f"rm -rf {pat}")
+            freed.append(f"临时文件 {mb}MB")
+    # 2) sing-box 旧版本备份（不保留）
+    c, o, _ = sh(f"ls -1 {SB_BIN}.bak.* 2>/dev/null")
+    olds = [x for x in o.splitlines() if x.strip()]
+    if olds:
+        tot = 0
+        for f in olds:
+            try:
+                tot += os.path.getsize(f) // 1024 // 1024
+            except OSError:
+                pass
+            sh(f"rm -f '{f}'")
+        freed.append(f"旧版本文件 {len(olds)} 个 / {tot}MB")
+    # 3) py 编译缓存
+    sh(f"rm -rf {SB_ETC}/__pycache__ 2>/dev/null")
+    if deep:
+        sh("apt-get clean >/dev/null 2>&1")
+        sh("journalctl --vacuum-size=30M >/dev/null 2>&1")
+        sh("rm -f /root/.acme.sh/acme.sh.log 2>/dev/null")
+        freed.append("apt缓存/系统日志")
+    return freed
+
+
+def disk_report():
+    out = {}
+    for p in ("/", "/tmp", os.path.dirname(SB_BIN)):
+        c, o, _ = sh(f"df -Pm {p} 2>/dev/null | tail -1 | awk '{{print $2\" \"$4}}'")
+        try:
+            tot, av = o.split()
+            out[p] = {"total": int(tot), "avail": int(av)}
+        except ValueError:
+            pass
+    _, fs, _ = sh("findmnt -no FSTYPE /tmp 2>/dev/null")
+    out["tmp_is_ram"] = fs.strip() == "tmpfs"
+    return out
+
+
+def janitor_loop():
+    """后台定期清理：启动后 1 分钟跑一次，之后每 12 小时一次"""
+    time.sleep(60)
+    while True:
+        try:
+            cleanup_disk(deep=False)
+        except Exception:
+            pass
+        time.sleep(12 * 3600)
+
+
 def safe_restart_self(delay=1):
     """重启面板自身。必须脱离自己的 cgroup，否则会被一起杀掉导致服务停摆。"""
     c, _, _ = sh("command -v systemd-run")
@@ -766,53 +827,53 @@ def install_version(ver, job=None):
     mirrors = [gh,
                f"https://ghfast.top/{gh}",
                f"https://gh-proxy.com/{gh}"]
-    tmp = f"/tmp/sbup-{secrets.token_hex(4)}"
+
+    # 直接解压到 sing-box 所在分区（通常是根盘，空间比 tmpfs 的 /tmp 大）
+    def free_mb(path):
+        c, o, _ = sh(f"df -Pm {path} 2>/dev/null | tail -1 | awk '{{print $4}}'")
+        try:
+            return int(o.strip())
+        except ValueError:
+            return -1
+
+    dest_dir = os.path.dirname(SB_BIN)
+    os.makedirs(dest_dir, exist_ok=True)
+    avail = free_mb(dest_dir)
+    if 0 <= avail < 100:
+        return False, (f"磁盘空间不足：{dest_dir} 仅剩 {avail}MB，需要至少 100MB\n"
+                       f"清理建议： apt-get clean ; journalctl --vacuum-size=20M")
+
+    tmp = f"{dest_dir}/.up-{secrets.token_hex(4)}"
     os.makedirs(tmp, exist_ok=True)
     try:
-        # 磁盘空间预检（下载 ~30MB + 解压 ~95MB）
-        c, o, _ = sh(f"df -Pm {os.path.dirname(tmp)} | tail -1 | awk '{{print $4}}'")
-        try:
-            freemb = int(o.strip())
-            if freemb < 200:
-                return False, (f"磁盘空间不足：/tmp 仅剩 {freemb}MB，需要至少 200MB\n"
-                               f"可清理后重试： rm -rf /tmp/sbup-* ; apt-get clean")
-        except ValueError:
-            pass
-
+        # 流式下载并只解压 sing-box 二进制（跳过 libcronet.so 等），磁盘峰值最小
         okdl = False
         lasterr = ""
         for i, url in enumerate(mirrors):
-            step(f"下载中 ({'官方源' if i == 0 else '镜像 ' + str(i)})")
-            sh(f"rm -f {tmp}/sb.tar.gz")
-            c, o, e = sh(f"curl -fL --max-time 180 --retry 2 --retry-delay 2 "
-                         f"-w '%{{http_code}}' -o {tmp}/sb.tar.gz '{url}'", 200)
-            sz = os.path.getsize(f"{tmp}/sb.tar.gz") if os.path.exists(f"{tmp}/sb.tar.gz") else 0
-            if c != 0:
-                lasterr = f"curl 失败({e or o})"; continue
-            if sz < 5 * 1024 * 1024:
-                lasterr = f"文件过小 {sz//1024}KB（可能是错误页或下载中断）"; continue
-            # 完整性校验：gzip 校验和
-            cz, _, ez = sh(f"gzip -t {tmp}/sb.tar.gz", 60)
-            if cz != 0:
-                lasterr = f"文件损坏/下载不完整（{sz//1024//1024}MB，gzip 校验失败）"; continue
-            okdl = True
-            break
+            step(f"下载并解压 ({'官方源' if i == 0 else '镜像 ' + str(i)})")
+            sh(f"rm -rf {tmp}/* 2>/dev/null")
+            # 精确路径：GNU tar 与 bsdtar 均支持
+            c, o, e = sh(
+                f"curl -fL --max-time 240 --retry 2 --retry-delay 2 '{url}' | "
+                f"tar -xzf - -C {tmp} '{pkg}/sing-box' 2>&1", 260)
+            found = sh(f"find {tmp} -type f -name sing-box | head -1")[1].strip()
+            if not found:
+                # 兜底：包内目录名与预期不符时用通配
+                sh(f"rm -rf {tmp}/* 2>/dev/null")
+                sh(f"curl -fL --max-time 240 '{url}' | "
+                   f"tar -xzf - -C {tmp} --wildcards '*/sing-box' 2>&1", 260)
+                found = sh(f"find {tmp} -type f -name sing-box | head -1")[1].strip()
+            if found and os.path.getsize(found) > 5 * 1024 * 1024:
+                binsrc = found
+                okdl = True
+                break
+            lasterr = (e or o or "下载或解压中断")[:200]
         if not okdl:
             return False, f"下载失败：{lasterr}\n{gh}"
 
-        step("解压中")
-        c, o, e = sh(f"tar -xzf {tmp}/sb.tar.gz -C {tmp}", 120)
-        if c != 0:
-            return False, f"解压失败：{(e or o)[:300]}"
-        # 不假设目录名，直接找二进制
-        c, found, _ = sh(f"find {tmp} -type f -name sing-box -perm -u+x | head -1")
-        binsrc = found.strip()
-        if not binsrc:
-            _, lst, _ = sh(f"ls -R {tmp} | head -20")
-            return False, f"包内未找到 sing-box 可执行文件\n{lst[:300]}"
-
-        step("备份并安装")
-        bak = f"{SB_BIN}.bak.{int(time.time())}"
+        step("安装中")
+        # 临时备份仅用于失败回滚，成功后随 tmp 目录一并删除，不留残余
+        bak = f"{tmp}/sing-box.prev"
         if os.path.exists(SB_BIN):
             sh(f"cp {SB_BIN} {bak}")
         sh("systemctl stop sing-box")
@@ -841,7 +902,9 @@ def install_version(ver, job=None):
             return False, f"启动失败，已回滚:\n{log[-400:]}"
 
         # 只保留最近 3 个备份
-        sh(f"ls -1t {SB_BIN}.bak.* 2>/dev/null | tail -n +4 | xargs -r rm -f")
+        # 成功：清掉全部历史备份与临时文件，不保留旧版本
+        sh(f"rm -f {SB_BIN}.bak.* 2>/dev/null")
+        cleanup_disk(deep=False)
         return True, cur_version()
     finally:
         sh(f"rm -rf {tmp}")
@@ -1279,7 +1342,17 @@ async function loadVer(){const box=document.getElementById('verbox');
      ${isCur?'<b style="color:#3ddc84">使用中</b>'
             :`<button class="btn2" style="padding:4px 12px;font-size:12px" onclick="doInstall('${v.ver}')">切换</button>`}
    </div>`}).join('');
- box.innerHTML=banner+`<div class="card"><h3>当前版本</h3>
+ const dk=await api('/disk').catch(()=>null);
+ let disk='';
+ if(dk){const root=dk['/']||{},t=dk['/tmp']||{};
+  const low=(root.avail||999)<150;
+  disk=`<div class="card"><h3>磁盘 ${low?'<span class="badge" style="background:#3a1f22;color:#ff8080">空间不足</span>':''}</h3>
+   <div class="row"><span>根分区 /</span><span>可用 <b>${root.avail||'?'}MB</b> / ${root.total||'?'}MB</span></div>
+   <div class="row"><span>/tmp</span><span>可用 ${t.avail||'?'}MB / ${t.total||'?'}MB ${dk.tmp_is_ram?'<i style="color:#f0c674;font-style:normal;font-size:12px">内存盘</i>':''}</span></div>
+   <div class="acts"><button class="btn2" onclick="doClean(0)">清理残留</button>
+   <button class="btn2" onclick="doClean(1)">深度清理 (含apt/日志)</button></div>
+   <p style="color:#8b93a1;font-size:12px;margin-top:8px">升级需要约 100MB。后台每 12 小时自动清理一次残留</p></div>`}
+ box.innerHTML=banner+disk+`<div class="card"><h3>当前版本</h3>
    <div class="row"><span>版本</span><span><b>${esc(cur)}</b></span></div>
    <div class="row"><span>锁定</span><span>${pin?`<b style="color:#f0c674">${esc(pin)}</b>`:'未锁定'}</span></div>
    <div class="acts">
@@ -1319,6 +1392,11 @@ function manualVer(){document.getElementById('mbox').innerHTML=`<h2>手动指定
  <div class="acts"><button onclick="(async()=>{const v=document.getElementById('mv').value.trim();if(!v)return;closeM();doInstall(v)})()">安装</button>
  <button class="btn2" onclick="closeM()">取消</button></div>`;
  document.getElementById('modal').classList.add('show')}
+async function doClean(deep){
+ if(deep&&!confirm('深度清理会清空 apt 缓存并压缩系统日志，确定？'))return;
+ msg('清理中…',1);
+ const r=await api('/cleanup','POST',{deep:!!deep});
+ msg(r.msg,1);loadVer()}
 async function doPin(p){const r=await api('/pin-version','POST',{pin:p});msg(r.msg,1);loadVer()}
 async function loadLog(){const r=await api('/logs');document.getElementById('logbox').textContent=r.log}
 function esc(s){return String(s).replace(/[<>&"]/g,c=>({'<':'&lt;','>':'&gt;','&':'&amp;','"':'&quot;'}[c]))}
@@ -1547,6 +1625,8 @@ class Handler(BaseHTTPRequestHandler):
                     "running": running,
                     "legacy": legacy,
                 })
+            if p == "/api/disk":
+                return self._send(200, disk_report())
             if p == "/api/logs":
                 _, log, _ = sh("journalctl -u sing-box -n 80 --no-pager")
                 return self._send(200, {"log": log})
@@ -1605,6 +1685,11 @@ class Handler(BaseHTTPRequestHandler):
                     return self._send(200, {"ok": False, "msg": "已有证书任务在进行中"})
                 issue_cert_async(d)
                 return self._send(200, {"ok": True, "async": True})
+            if p == "/api/cleanup":
+                freed = cleanup_disk(deep=bool(b.get("deep")))
+                return self._send(200, {"ok": True,
+                                        "msg": ("已清理：" + "、".join(freed)) if freed else "没有可清理的内容",
+                                        "disk": disk_report()})
             if p == "/api/restart":
                 c, _, _ = sh("systemctl restart sing-box")
                 return self._send(200, {"ok": c == 0})
@@ -1730,6 +1815,7 @@ def main():
         sys.exit(1)
     os.makedirs(SUB_DIR, exist_ok=True)
     rebuild_sub()
+    threading.Thread(target=janitor_loop, daemon=True).start()
 
     # 订阅服务与面板同进程（省一个 Python 解释器约 20MB）
     sub_port = int(pc.get("sub_port", 8080))

@@ -77,9 +77,14 @@ install_singbox() {
     fi
     tar -xzf "$tmp/sb.tar.gz" -C "$tmp" || { rm -rf "$tmp"; die "解压失败"; }
     mkdir -p "$SB_DIR"
-    [[ -x "$SB_BIN" ]] && cp "$SB_BIN" "${SB_BIN}.bak.$(date +%Y%m%d%H%M)"
-    install -m 755 "$tmp/$pkg/sing-box" "$SB_BIN" || { rm -rf "$tmp"; die "安装失败"; }
+    # 临时备份仅用于失败回滚，随 $tmp 一并删除
+    [[ -x "$SB_BIN" ]] && cp "$SB_BIN" "$tmp/prev"
+    if ! install -m 755 "$tmp/$pkg/sing-box" "$SB_BIN"; then
+        [[ -f "$tmp/prev" ]] && cp "$tmp/prev" "$SB_BIN"
+        rm -rf "$tmp"; die "安装失败，已还原"
+    fi
     rm -rf "$tmp"
+    rm -f "${SB_BIN}".bak.* 2>/dev/null    # 清掉历史备份
     ok "sing-box ${ver} 已安装"
 }
 
@@ -384,7 +389,7 @@ do_upgrade() {
     install_singbox "$target"
     if [[ -f "$SB_CONF" ]] && ! "$SB_BIN" check -c "$SB_CONF" 2>/tmp/sb_err; then
         err "新版本校验配置失败:"; cat /tmp/sb_err
-        warn "可回滚: cp ${SB_BIN}.bak.* $SB_BIN && systemctl restart sing-box"
+        warn "可在菜单重新选择其他版本安装"
     fi
     systemctl start sing-box
     systemctl is-active --quiet sing-box && ok "升级完成" || err "启动失败: journalctl -u sing-box"
@@ -907,6 +912,28 @@ EOF
     done
 }
 
+clean_disk() {
+    title "磁盘清理"
+    echo "  清理前:"; df -h / /tmp 2>/dev/null | sed 's/^/    /'
+    echo
+    rm -rf "$SB_DIR"/.up-* /tmp/sbup-* /var/tmp/sbup-* 2>/dev/null
+    local n; n=$(ls -1 "$SB_BIN".bak.* 2>/dev/null | wc -l)
+    rm -f "$SB_BIN".bak.* 2>/dev/null
+    [[ $n -gt 0 ]] && ok "删除 $n 个旧版本文件"
+    rm -rf "$SB_ETC/__pycache__" 2>/dev/null
+    read -rp "$(echo -e "${BLUE}?${NC} 是否同时清理 apt 缓存和系统日志? [y/N]: ")" d
+    if [[ "$d" =~ ^[Yy]$ ]]; then
+        apt-get clean >/dev/null 2>&1
+        journalctl --vacuum-size=30M >/dev/null 2>&1
+        rm -f /root/.acme.sh/acme.sh.log 2>/dev/null
+        ok "已清理 apt 缓存与日志"
+    fi
+    echo; echo "  清理后:"; df -h / /tmp 2>/dev/null | sed 's/^/    /'
+    if findmnt -no FSTYPE /tmp 2>/dev/null | grep -q tmpfs; then
+        echo; warn "/tmp 是内存盘(tmpfs)，占用它等于占用内存；本工具已避开不使用 /tmp"
+    fi
+}
+
 do_uninstall() {
     title "完全卸载"
     echo "  将删除: 服务 / 程序 / 配置 / 节点 / 证书 / 快捷命令 / BBR调优 / 端口跳跃规则"
@@ -980,6 +1007,7 @@ main_menu() {
   6) 重启 sing-box
   7) 查看日志
   8) 更新脚本与面板 (从 GitHub)
+  c) 磁盘清理
   ─────────────────────────
   9) 完全卸载 sing-box
   0) 退出
@@ -994,6 +1022,7 @@ EOF
             6) systemctl restart sing-box && ok "已重启" ;;
             7) journalctl -u sing-box -n 50 --no-pager ;;
             8) update_self ;;
+            c|C) clean_disk ;;
             9) do_uninstall ;;
             0) exit 0 ;;
             *) err "无效选择" ;;

@@ -1144,7 +1144,7 @@ def api_add_inbound(body):
         return False, msg
     m = meta()
     m[tag] = {"name": f.get("name", tag), "uri": uri, "proto": proto,
-              "created": time.strftime("%F %T")}
+              "fields": f, "created": time.strftime("%F %T")}
     save_json(META_FILE, m)
     rebuild_sub()
     if proto == "hysteria2" and f.get("hop"):
@@ -1167,6 +1167,51 @@ def setup_hop(rng, target):
        "netfilter-persistent save >/dev/null 2>&1", 60)
 
 
+def api_edit_inbound(tag, body):
+    c = cfg()
+    old = next((i for i in c.get("inbounds", []) if i.get("tag") == tag), None)
+    if not old:
+        return False, "节点不存在"
+    m = meta()
+    info = m.get(tag, {})
+    proto = body.get("proto") or info.get("proto")
+    if proto not in PROTOCOLS:
+        return False, "未知协议"
+    f = body.get("fields", {})
+    if PROTOCOLS[proto]["needs_cert"]:
+        d = f.get("cert", "")
+        if d and not os.path.exists(f"{CERT_DIR}/{d}/fullchain.pem"):
+            return False, "所选证书不存在"
+    try:
+        ib, uri = build_inbound(proto, f, tag)
+    except Exception as e:
+        return False, f"生成失败: {e}"
+    extra = ib.pop("_extra_inbound", None)
+
+    # 原地替换，保持顺序；同时更新 ShadowTLS 的配套入站
+    newins = []
+    for i in c.get("inbounds", []):
+        if i.get("tag") == tag:
+            newins.append(ib)
+        elif i.get("tag") == f"{tag}-ss":
+            continue          # 旧的配套入站丢弃，稍后按需重建
+        else:
+            newins.append(i)
+    if extra:
+        newins.append(extra)
+    c["inbounds"] = newins
+
+    okk, msg = apply_config(c)
+    if not okk:
+        return False, msg
+    info.update({"name": f.get("name", tag), "uri": uri, "proto": proto,
+                 "fields": f, "edited": time.strftime("%F %T")})
+    m[tag] = info
+    save_json(META_FILE, m)
+    rebuild_sub()
+    return True, {"tag": tag, "uri": uri}
+
+
 def api_del_inbound(tag):
     c = cfg()
     # ShadowTLS 的配套内部入站一并删除
@@ -1184,38 +1229,55 @@ def api_del_inbound(tag):
     return True, "已删除"
 
 
-def api_add_outbound(body):
+def _parse_ob(body):
+    """解析出站表单，返回 (ob_dict, err)"""
+    kind = body.get("kind", "socks")
+    srv = (body.get("server") or "").strip()
+    port = str(body.get("port") or "").strip()
+    user = (body.get("username") or "").strip()
+    pw = (body.get("password") or "").strip()
+    # 兼容旧的 ip:端口:账号:密码 一行格式
     raw = (body.get("raw") or "").strip()
-    tag = (body.get("tag") or "").strip()
-    kind = body.get("kind", "socks")          # socks | http
-    tls_on = bool(body.get("tls"))            # HTTP 出站是否走 HTTPS
-    binds = body.get("binds") or []
-    parts = raw.split(":")
-    if len(parts) < 2:
-        return False, "格式应为 ip:端口:账号:密码 (无认证可省略后两段)"
-    ip, port = parts[0].strip(), parts[1].strip()
-    user = parts[2] if len(parts) > 2 else ""
-    pw = parts[3] if len(parts) > 3 else ""
-    if not port.isdigit():
-        return False, "端口无效"
-    if not tag:
-        tag = f"landing-{ip.split('.')[-1]}"
-    c = cfg()
-    if any(o.get("tag") == tag for o in c.get("outbounds", [])):
-        return False, f"出站名 {tag} 已存在"
+    if raw and not srv:
+        parts = raw.split(":")
+        if len(parts) >= 2:
+            srv, port = parts[0].strip(), parts[1].strip()
+            user = parts[2] if len(parts) > 2 else ""
+            pw = parts[3] if len(parts) > 3 else ""
+    if not srv:
+        return None, "服务器地址不能为空"
+    if not port.isdigit() or not (1 <= int(port) <= 65535):
+        return None, "服务器端口无效"
 
+    tag = (body.get("tag") or "").strip() or f"{kind}-{srv.split('.')[-1]}"
     if kind == "http":
-        ob = {"type": "http", "tag": tag, "server": ip, "server_port": int(port)}
-        if tls_on:
-            ob["tls"] = {"enabled": True, "server_name": ip, "insecure": True}
+        ob = {"type": "http", "tag": tag, "server": srv, "server_port": int(port)}
+        if body.get("tls"):
+            ob["tls"] = {"enabled": True, "server_name": srv, "insecure": True}
     else:
-        ob = {"type": "socks", "tag": tag, "server": ip, "server_port": int(port),
-              "version": "5"}
+        ob = {"type": "socks", "tag": tag, "server": srv, "server_port": int(port),
+              "version": str(body.get("version") or "5")}
+        net = (body.get("network") or "").strip()
+        if net in ("tcp", "udp"):
+            ob["network"] = net          # 留空 = TCP/UDP 都启用
         if body.get("uot"):
-            ob["udp_over_tcp"] = True      # UDP over TCP（需落地支持 UoT）
+            ob["udp_over_tcp"] = True
     if user:
         ob["username"] = user
         ob["password"] = pw
+    return ob, None
+
+
+def api_add_outbound(body):
+    binds = body.get("binds") or []
+    kind = body.get("kind", "socks")
+    ob, err = _parse_ob(body)
+    if err:
+        return False, err
+    tag = ob["tag"]
+    c = cfg()
+    if any(o.get("tag") == tag for o in c.get("outbounds", [])):
+        return False, f"出站名 {tag} 已存在"
     c.setdefault("outbounds", []).append(ob)
 
     # 同时绑定所选节点（合并到一次写入，避免多次重启）
@@ -1237,6 +1299,30 @@ def api_add_outbound(body):
 
     okk, msg = apply_config(c)
     return (True, {"tag": tag, "bound": len(binds)}) if okk else (False, msg)
+
+
+def api_edit_outbound(tag, body):
+    c = cfg()
+    if not any(o.get("tag") == tag for o in c.get("outbounds", [])):
+        return False, "出站不存在"
+    ob, err = _parse_ob(body)
+    if err:
+        return False, err
+    newtag = ob["tag"]
+    if newtag != tag and any(o.get("tag") == newtag for o in c.get("outbounds", [])):
+        return False, f"出站名 {newtag} 已存在"
+
+    c["outbounds"] = [ob if o.get("tag") == tag else o for o in c.get("outbounds", [])]
+    # 改名时同步路由绑定与 final
+    if newtag != tag:
+        for r in c.get("route", {}).get("rules", []):
+            if r.get("outbound") == tag:
+                r["outbound"] = newtag
+        if c.get("route", {}).get("final") == tag:
+            c["route"]["final"] = newtag
+
+    okk, msg = apply_config(c)
+    return (True, {"tag": newtag}) if okk else (False, msg)
 
 
 def api_del_outbound(tag):
@@ -1261,6 +1347,62 @@ def api_bind(inbound, outbound):
     c["route"]["rules"] = rules
     okk, msg = apply_config(c)
     return (True, "已更新") if okk else (False, msg)
+
+
+SPEED_JOB = {}     # tag -> {running, ok, msg, ip, latency, speed}
+
+
+def _proxy_arg(o):
+    srv, port = o.get("server"), o.get("server_port")
+    auth = f"{o['username']}:{o.get('password','')}@" if o.get("username") else ""
+    if o.get("type") == "http":
+        sch = "https" if (o.get("tls") or {}).get("enabled") else "http"
+        return f"-x {sch}://{auth}{srv}:{port}" + (" --proxy-insecure" if sch == "https" else "")
+    return f"--socks5-hostname {auth}{srv}:{port}"
+
+
+def speedtest_outbound(tag):
+    """经出站测延迟（gstatic 204，3 次取平均/最快）+ 出口 IP"""
+    job = SPEED_JOB.setdefault(tag, {})
+    job.update(running=True, ok=None, msg="", step="测试中")
+    try:
+        o = next((x for x in cfg().get("outbounds", []) if x.get("tag") == tag), None)
+        if not o:
+            job.update(running=False, ok=False, msg="出站不存在")
+            return
+        px = _proxy_arg(o)
+        url = "https://www.gstatic.com/generate_204"
+
+        lats = []
+        for i in range(3):
+            job["step"] = f"测试中 {i + 1}/3"
+            c, out, _ = sh(f"curl -s -o /dev/null --max-time 8 {px} "
+                           f"-w '%{{http_code}} %{{time_connect}} %{{time_total}}' {url}", 12)
+            try:
+                code, tc, tt = out.split()
+                if code in ("204", "200"):
+                    lats.append(float(tt) * 1000)
+            except ValueError:
+                pass
+        if not lats:
+            job.update(running=False, ok=False, msg="不通（检查地址/账号密码）")
+            return
+
+        avg = round(sum(lats) / len(lats))
+        best = round(min(lats))
+        # 顺带取出口 IP（失败不影响结果）
+        _, ipout, _ = sh(f"curl -s --max-time 8 {px} https://api.ipify.org", 12)
+        ip = ipout.strip()[:45]
+
+        job.update(running=False, ok=True, latency=avg, best=best, ip=ip,
+                   loss=round((3 - len(lats)) / 3 * 100),
+                   msg=f"{avg}ms（最快 {best}ms）" + (f" · {ip}" if ip else ""))
+    except Exception as e:
+        job.update(running=False, ok=False, msg=f"异常: {e}")
+
+
+def speedtest_async(tag):
+    threading.Thread(target=speedtest_outbound, args=(tag,), daemon=True).start()
 
 
 def api_test_outbound(tag):
@@ -1343,6 +1485,8 @@ input:focus,select:focus{outline:0;border-color:#2563eb}
 .sok{cursor:pointer}.sok b{color:#3ddc84}
 .sok:hover{background:#1e3a2a}
 .sbad{opacity:.45}.sbad b{color:#8b93a1}
+.f2{display:grid;grid-template-columns:1fr 1fr;gap:12px}
+.f2 label{margin-top:12px}
 .chkbox{background:#0f1114;border:1px solid #2c313a;border-radius:8px;padding:6px;max-height:210px;overflow:auto}
 .chk{display:flex;align-items:center;gap:10px;padding:8px 10px;border-radius:6px;cursor:pointer;margin:0;color:#e6e8eb;font-size:14px}
 .chk:hover{background:#1a1d23}
@@ -1377,7 +1521,8 @@ pre{background:#0f1114;padding:12px;border-radius:8px;overflow:auto;font-size:12
   <div class="tab" data-t="log" onclick="tab('log')">日志</div>
 </div>
 <div id="v-in"><div class="acts" style="margin-bottom:14px"><button onclick="newNode()">+ 添加节点</button></div><div id="inlist" class="grid"></div></div>
-<div id="v-out" style="display:none"><div class="acts" style="margin-bottom:14px"><button onclick="newOut()">+ 添加出站代理</button></div><div id="outlist" class="grid"></div></div>
+<div id="v-out" style="display:none"><div class="acts" style="margin-bottom:14px"><button onclick="newOut()">+ 添加出站</button>
+ <button class="btn2" onclick="speedAll()">⚡ 全部测延迟</button></div><div id="outlist" class="grid"></div></div>
 <div id="v-cert" style="display:none"><div class="acts" style="margin-bottom:14px"><button onclick="newCert()">+ 申请证书</button></div><div id="certlist" class="grid"></div></div>
 <div id="v-sub" style="display:none"><div class="card"><h3>订阅链接</h3>
  <div class="uri" id="suburl" onclick="cp(this.textContent)"></div>
@@ -1411,7 +1556,8 @@ async function loadIn(){const l=await api('/inbounds');OUTS=await api('/outbound
   <div class="row"><span>端口</span><span>${n.port}</span></div>
   <div class="row"><span>出站</span><span>${n.bind==='direct'?'直连':esc(n.bind)}</span></div>
   ${n.uri?`<div class="uri" onclick="cp(this.textContent)">${esc(n.uri)}</div>`:''}
-  <div class="acts"><button class="btn2" onclick="bindDlg('${encodeURIComponent(n.tag)}','${encodeURIComponent(n.bind)}')">绑定出站</button>
+  <div class="acts"><button class="btn2" onclick="editNode('${encodeURIComponent(n.tag)}')">编辑</button>
+  <button class="btn2" onclick="bindDlg('${encodeURIComponent(n.tag)}','${encodeURIComponent(n.bind)}')">绑定出站</button>
   <button class="btnd" onclick="delIn('${encodeURIComponent(n.tag)}')">删除</button></div></div>`).join(''):'<div class="empty">还没有节点，点上方添加</div>'}
 async function loadOut(){OUTS=await api('/outbounds');
  document.getElementById('outlist').innerHTML=OUTS.length?OUTS.map(o=>`<div class="card"><h3>${esc(o.tag)}<span class="badge">${o.type}</span></h3>
@@ -1419,19 +1565,38 @@ async function loadOut(){OUTS=await api('/outbounds');
   <div class="row"><span>端口</span><span>${o.port}</span></div>
   <div class="row"><span>协议</span><span>${o.type==='http'?(o.tls?'HTTPS':'HTTP'):'SOCKS5'}${o.auth?' · 已认证':' · 无认证'}</span></div>
   <div class="row"><span>状态</span><span id="t-${esc(o.tag)}">-</span></div>
+  <div class="row"><span>延迟</span><span id="sp-${esc(o.tag)}">-</span></div>
   <div class="acts"><button class="btn2" onclick="testOut('${encodeURIComponent(o.tag)}')">测试</button>
+  <button class="btn2" onclick="speedOut('${encodeURIComponent(o.tag)}')">⚡ 测延迟</button>
+  <button class="btn2" onclick="editOut('${encodeURIComponent(o.tag)}')">编辑</button>
   <button class="btnd" onclick="delOut('${encodeURIComponent(o.tag)}')">删除</button></div></div>`).join(''):'<div class="empty">暂无出站，节点走本机直连</div>'}
 async function loadCerts(){const r=await api('/certs');CERTS=r.certs||[];
  const cur=r.panel_tls||'';
  let head=`<div class="card" style="grid-column:1/-1"><h3>面板访问方式</h3>
    <div class="row"><span>当前</span><span>${cur?`<b style="color:#3ddc84">https://${esc(cur)}:${r.panel_port}</b>`:`http://127.0.0.1:${r.panel_port} <i style="color:#6b7280;font-style:normal">(仅本机，需 SSH 隧道)</i>`}</span></div>
-   ${cur?`<div class="acts"><button class="btnd" onclick="setPanelTls('')">关闭 HTTPS，改回仅本机</button></div>`:
-        `<p style="color:#8b93a1;font-size:12px;margin-top:8px">下方证书点「用于面板」即可用域名 HTTPS 访问</p>`}</div>`;
+   <div class="acts"><button class="btn2" onclick="pathDlg()">更换访问路径</button>
+   ${cur?`<button class="btnd" onclick="setPanelTls('')">关闭 HTTPS，改回仅本机</button>`:''}</div>
+   ${cur?'':`<p style="color:#8b93a1;font-size:12px;margin-top:8px">下方证书点「用于面板」即可用域名 HTTPS 访问</p>`}</div>`;
  document.getElementById('certlist').innerHTML=head+(CERTS.length?CERTS.map(c=>`<div class="card">
    <h3>${c.domain}${cur===c.domain?'<span class="badge" style="background:#1e3a2a;color:#8ff0b5">面板使用中</span>':''}</h3>
    <div class="row"><span>到期</span><span>${c.expire}</span></div>
    ${cur!==c.domain?`<div class="acts"><button class="btn2" onclick="setPanelTls('${c.domain}')">用于面板 HTTPS</button></div>`:''}
    </div>`).join(''):'<div class="empty">暂无证书，点上方申请</div>')}
+function pathDlg(){document.getElementById('mbox').innerHTML=`<h2>更换面板访问路径</h2>
+ <p style="color:#8b93a1;font-size:13px;margin-bottom:8px">路径可防止面板被扫描器发现。更换后旧地址立即 404</p>
+ <label>路径（留空=取消路径，4-64 位字母/数字/-/_）</label>
+ <input id="pp-v" placeholder="留空则取消">
+ <div class="acts"><button onclick="savePath(0)">保存</button>
+ <button class="btn2" onclick="savePath(1)">随机生成</button>
+ <button class="btn2" onclick="closeM()">取消</button></div>`;
+ document.getElementById('modal').classList.add('show')}
+async function savePath(rand){
+ const r=await api('/panel-path','POST',{path:rand?'':document.getElementById('pp-v').value,random:!!rand});
+ if(!r.ok)return msg(r.msg);
+ document.getElementById('mbox').innerHTML=`<h2>路径已更换</h2>
+  <p style="color:#8b93a1;font-size:13px;margin:8px 0">请用新地址访问（当前页面已失效）：</p>
+  <div class="uri" onclick="cp(this.textContent)">${esc(r.url)}</div>
+  <div class="acts"><button onclick="location.href='${r.url}'">前往新地址</button></div>`}
 async function setPanelTls(d){
  if(d&&!confirm(`将面板改为 https://${d}:端口 访问？\n\n注意：面板会监听公网，建议用防火墙限制来源 IP。`))return;
  if(!d&&!confirm('关闭 HTTPS？面板将只监听 127.0.0.1，需要 SSH 隧道才能访问。'))return;
@@ -1461,7 +1626,8 @@ async function loadSub(){let r;
  h+=`<div class="row"><span>地址类型</span><span>${r.domain?`<b style="color:#3ddc84">域名 HTTPS</b>`:'IP + HTTP <i style="color:#6b7280;font-style:normal;font-size:12px">（证书页启用 HTTPS 后自动改用域名）</i>'}</span></div>`;
  if(r.count)h+=`<div class="row"><span>包含</span><span>${r.names.map(esc).join('、')}</span></div>`;
  else h+=`<div class="alert">订阅内没有节点。请先到「节点」页创建节点。</div>`;
- h+=`<div class="acts"><button class="btn2" onclick="window.open(document.getElementById('suburl').textContent+'?plain=1')">查看明文内容</button></div>`;
+ h+=`<div class="acts"><button class="btn2" onclick="window.open(document.getElementById('suburl').textContent+'?plain=1')">查看明文内容</button>
+   <button class="btn2" onclick="subTokenDlg()">更换订阅地址</button></div>`;
  h+=`<p style="color:#8b93a1;font-size:12px;margin-top:10px">点击链接可复制 · token 即密码，勿外泄</p>`;
  document.getElementById('subinfo').innerHTML=h}
 async function loadVer(){const box=document.getElementById('verbox');
@@ -1560,8 +1726,47 @@ async function doClean(deep){
  const r=await api('/cleanup','POST',{deep:!!deep});
  msg(r.msg,1);loadVer()}
 async function doPin(p){const r=await api('/pin-version','POST',{pin:p});msg(r.msg,1);loadVer()}
+function subTokenDlg(){document.getElementById('mbox').innerHTML=`<h2>更换订阅地址</h2>
+ <p style="color:#f0c674;font-size:13px;margin-bottom:8px">⚠ 更换后旧地址立即失效，所有客户端都要改成新地址</p>
+ <label>自定义 token（留空则随机生成）</label>
+ <input id="st-tok" placeholder="8-64 位字母/数字/-/_">
+ <div class="acts"><button onclick="saveSubToken()">更换</button>
+ <button class="btn2" onclick="closeM()">取消</button></div>`;
+ document.getElementById('modal').classList.add('show')}
+async function saveSubToken(){
+ const r=await api('/sub-token','POST',{token:document.getElementById('st-tok').value});
+ if(!r.ok)return msg(r.msg);
+ document.getElementById('mbox').innerHTML=`<h2>订阅地址已更换</h2>
+  <div class="uri" onclick="cp(this.textContent)">${esc(r.url)}</div>
+  <p style="color:#f0c674;font-size:12px;margin-top:8px">旧地址已失效，请更新所有客户端</p>
+  <div class="acts"><button onclick="closeM();loadSub()">完成</button></div>`}
 async function loadLog(){const r=await api('/logs');document.getElementById('logbox').textContent=r.log}
 function esc(s){return String(s).replace(/[<>&"]/g,c=>({'<':'&lt;','>':'&gt;','&':'&amp;','"':'&quot;'}[c]))}
+async function editNode(t0){const t=decodeURIComponent(t0);
+ const d=await api('/inbound-detail/'+encodeURIComponent(t));
+ if(!d.ok)return msg(d.msg||'读取失败');
+ if(!d.fields)return msg('该节点创建于旧版本，无法编辑，请删除后重建');
+ const spec=PROTOS[d.proto];
+ if(!spec)return msg('未知协议');
+ document.getElementById('mbox').innerHTML=`<h2>编辑节点 · ${esc(d.name)}</h2>
+  <p style="color:#8b93a1;font-size:12px;margin-bottom:6px">协议：${esc(spec.label)}（不可更改）· 出站绑定保持不变</p>
+  <div id="fields"></div>
+  <div class="acts"><button onclick="saveEdit('${encodeURIComponent(t)}','${d.proto}')">保存</button>
+  <button class="btn2" onclick="closeM()">取消</button></div>`;
+ document.getElementById('modal').classList.add('show');
+ if(spec.needs_cert&&!CERTS.length){const cr=await api('/certs');CERTS=cr.certs||[]}
+ document.getElementById('fields').innerHTML=spec.fields.map(f=>{
+   const v=d.fields[f.k]!==undefined?d.fields[f.k]:(f.d||'');
+   if(f.t==='cert'){const o=CERTS.map(c=>`<option value="${c.domain}" ${c.domain===v?'selected':''}>${c.domain}</option>`).join('');
+     return `<label>${f.l}</label>${CERTS.length?`<select id="f-${f.k}">${o}</select>`:'<div style="color:#ff9b9b;font-size:13px">无可用证书</div>'}`}
+   if(f.t==='select')return `<label>${f.l}</label><select id="f-${f.k}">${f.opts.map(o=>`<option ${o===v?'selected':''}>${o}</option>`).join('')}</select>`;
+   if(f.t==='dest')return `<label>${f.l} <a href="javascript:;" onclick="scanDest()">⚡ 扫描可用目标</a></label>
+     <input id="f-${f.k}" type="text" value="${esc(v)}"><div id="scanres"></div>`;
+   return `<label>${f.l}</label><input id="f-${f.k}" type="${f.t}" value="${esc(v)}">`}).join('')}
+async function saveEdit(t0,proto){const t=decodeURIComponent(t0),fs={};
+ PROTOS[proto].fields.forEach(f=>{const e=document.getElementById('f-'+f.k);if(e)fs[f.k]=e.value});
+ const r=await api('/inbound-edit/'+encodeURIComponent(t),'POST',{proto:proto,fields:fs});
+ if(r.ok){closeM();msg('已保存，客户端需重新拉订阅',1);loadIn();refresh()}else alert(r.msg)}
 function newNode(){const opts=Object.entries(PROTOS).map(([k,v])=>`<option value="${k}">${v.label}</option>`).join('');
  document.getElementById('mbox').innerHTML=`<h2>添加节点</h2><label>协议</label><select id="proto" onchange="renderF()">${opts}</select><div id="fields"></div>
  <div class="acts"><button onclick="saveNode()">创建</button><button class="btn2" onclick="closeM()">取消</button></div>`;
@@ -1594,52 +1799,119 @@ async function saveNode(){const p=document.getElementById('proto').value,fs={};
  if(r.ok){closeM();msg('节点已创建',1);loadIn();refresh()}else msg(r.msg)}
 async function delIn(t0){const t=decodeURIComponent(t0);if(!confirm('删除节点 '+t+'?'))return;const r=await api('/inbounds/'+encodeURIComponent(t),'DELETE');
  if(r.ok){msg('已删除',1);loadIn();refresh()}else msg(r.msg)}
+function obForm(d){  // d=已有数据(编辑) 或 null(新增)
+ d=d||{};
+ const k=d.kind||'socks';
+ return `<label>类型</label>
+ <select id="o-kind" onchange="onKindChange()">
+   <option value="socks" ${k==='socks'?'selected':''}>SOCKS（支持 UDP，推荐）</option>
+   <option value="http" ${k==='http'?'selected':''}>HTTP / HTTPS（仅 TCP）</option>
+ </select>
+ <div class="f2">
+  <div><label>标签</label><input id="o-tag" value="${esc(d.tag||'')}" placeholder="留空自动生成"></div>
+  <div><label>服务器地址</label><input id="o-srv" value="${esc(d.server||'')}" placeholder="1.2.3.4"></div>
+ </div>
+ <div class="f2">
+  <div><label>服务器端口</label><input id="o-port" type="number" value="${esc(d.port||'')}" placeholder="1080"></div>
+  <div id="o-verbox"><label>版本</label>
+   <select id="o-ver">
+    <option value="5" ${String(d.version||'5')==='5'?'selected':''}>5</option>
+    <option value="4a" ${d.version==='4a'?'selected':''}>4a</option>
+    <option value="4" ${d.version==='4'?'selected':''}>4</option>
+   </select></div>
+ </div>
+ <div class="f2">
+  <div><label>用户名</label><input id="o-user" value="${esc(d.username||'')}" placeholder="留空=无认证"></div>
+  <div><label>密码</label><input id="o-pass" value="${esc(d.password||'')}"></div>
+ </div>
+ <div id="o-netbox"><label>网络</label>
+  <select id="o-net">
+   <option value="" ${!d.network?'selected':''}>TCP/UDP（默认）</option>
+   <option value="tcp" ${d.network==='tcp'?'selected':''}>仅 TCP</option>
+   <option value="udp" ${d.network==='udp'?'selected':''}>仅 UDP</option>
+  </select></div>
+ <label class="chk" id="o-tlsrow" style="display:${k==='http'?'flex':'none'};margin:8px 0">
+   <input type="checkbox" id="o-tls" ${d.tls?'checked':''}>
+   <span>使用 HTTPS 连接落地 <i>落地需支持 TLS</i></span></label>
+ <label class="chk" id="o-uotrow" style="display:${k==='http'?'none':'flex'};margin:4px 0">
+   <input type="checkbox" id="o-uot" ${d.uot?'checked':''}>
+   <span>UDP over TCP <i>仅当落地支持 UoT 时勾选</i></span></label>`}
+
+function onKindChange(){const k=document.getElementById('o-kind').value,g=id=>document.getElementById(id);
+ const http=k==='http';
+ if(g('o-tlsrow'))g('o-tlsrow').style.display=http?'flex':'none';
+ if(g('o-uotrow'))g('o-uotrow').style.display=http?'none':'flex';
+ if(g('o-verbox'))g('o-verbox').style.display=http?'none':'block';
+ if(g('o-netbox'))g('o-netbox').style.display=http?'none':'block';
+ if(g('o-quicrow'))g('o-quicrow').style.display=http?'none':'flex'}
+
+function obPayload(){const g=id=>document.getElementById(id);
+ const k=g('o-kind').value;
+ return {kind:k, tag:g('o-tag').value.trim(), server:g('o-srv').value.trim(),
+   port:g('o-port').value.trim(), username:g('o-user').value.trim(),
+   password:g('o-pass').value, version:g('o-ver')?g('o-ver').value:'5',
+   network:(k==='socks'&&g('o-net'))?g('o-net').value:'',
+   tls:k==='http'&&g('o-tls')?g('o-tls').checked:false,
+   uot:g('o-uot')?g('o-uot').checked:false}}
+
 async function newOut(){const nodes=await api('/inbounds');
  const list=nodes.length?nodes.map(n=>`<label class="chk"><input type="checkbox" class="nd" value="${n.tag}">
    <span>${esc(n.name)} <i>${n.type} · ${n.port}</i>${n.bind!=='direct'?`<em>当前: ${esc(n.bind)}</em>`:''}</span></label>`).join('')
    :'<div style="color:#5a626e;font-size:13px;padding:6px 0">还没有节点</div>';
- document.getElementById('mbox').innerHTML=`<h2>添加出站代理</h2>
- <label>代理类型</label>
- <select id="o-kind" onchange="onKindChange()">
-   <option value="socks">SOCKS5（支持 UDP，推荐）</option>
-   <option value="http">HTTP / HTTPS（仅 TCP）</option>
- </select>
- <label class="chk" id="o-tlsrow" style="display:none;margin:6px 0"><input type="checkbox" id="o-tls">
-   <span>使用 HTTPS 连接落地 <i>落地需支持 TLS</i></span></label>
- <label>落地信息 (ip:端口:账号:密码，无认证可省略后两段)</label><input id="o-raw" placeholder="1.2.3.4:1080:user:pass">
- <label>出站名称 (可留空自动生成)</label><input id="o-tag" placeholder="landing-1">
- <label>绑定节点 (可多选，选中的节点全部流量走此出站)
+ document.getElementById('mbox').innerHTML=`<h2>添加出站</h2>${obForm(null)}
+ <label style="margin-top:14px">绑定节点 (可多选，选中的节点全部流量走此出站)
    ${nodes.length?'<a href="javascript:;" onclick="allNd(1)">全选</a> / <a href="javascript:;" onclick="allNd(0)">清空</a>':''}</label>
  <div class="chkbox">${list}</div>
- <div id="o-udpbox">
- <label style="margin-top:14px">UDP 处理 <i style="color:#6b7280;font-style:normal;font-size:12px">(多数落地不支持 UDP，这是 hy2 走出站变慢的主因)</i></label>
- <label class="chk" style="margin:4px 0"><input type="checkbox" id="o-blockquic" checked>
-   <span>拒绝 QUIC，强制走 TCP <i>推荐 · 显著更稳</i></span></label>
- <label class="chk" style="margin:0"><input type="checkbox" id="o-uot">
-   <span>UDP over TCP <i>仅当落地支持 UoT 时勾选</i></span></label>
- </div>
+ <label class="chk" id="o-quicrow" style="margin:8px 0"><input type="checkbox" id="o-blockquic" checked>
+   <span>拒绝 QUIC，强制走 TCP <i>推荐 · 多数落地不支持 UDP</i></span></label>
  <div class="acts"><button onclick="saveOut()">添加</button><button class="btn2" onclick="closeM()">取消</button></div>`;
- document.getElementById('modal').classList.add('show')}
+ document.getElementById('modal').classList.add('show');onKindChange()}
+
 function allNd(v){document.querySelectorAll('.nd').forEach(e=>e.checked=!!v)}
-function onKindChange(){const k=document.getElementById('o-kind').value;
- document.getElementById('o-tlsrow').style.display=k==='http'?'flex':'none';
- const ub=document.getElementById('o-udpbox');
- if(k==='http'){ub.innerHTML='<div class="alert" style="margin-top:14px">HTTP 代理不支持 UDP，QUIC 将自动拒绝并回退 TCP</div>'}
- else if(!document.getElementById('o-blockquic')){ub.innerHTML=`
-   <label style="margin-top:14px">UDP 处理</label>
-   <label class="chk" style="margin:4px 0"><input type="checkbox" id="o-blockquic" checked>
-     <span>拒绝 QUIC，强制走 TCP <i>推荐 · 显著更稳</i></span></label>
-   <label class="chk" style="margin:0"><input type="checkbox" id="o-uot">
-     <span>UDP over TCP <i>仅当落地支持 UoT 时勾选</i></span></label>`}}
+
 async function saveOut(){const binds=[...document.querySelectorAll('.nd:checked')].map(e=>e.value);
- const k=document.getElementById('o-kind').value;
  const g=id=>document.getElementById(id);
- const r=await api('/outbounds','POST',{raw:g('o-raw').value,
-   tag:g('o-tag').value,binds:binds,kind:k,
-   tls:k==='http'&&g('o-tls')?g('o-tls').checked:false,
-   uot:g('o-uot')?g('o-uot').checked:false,
-   block_quic:g('o-blockquic')?g('o-blockquic').checked:true});
+ const p=obPayload();p.binds=binds;p.block_quic=g('o-blockquic')?g('o-blockquic').checked:true;
+ const r=await api('/outbounds','POST',p);
  if(r.ok){closeM();msg('出站已添加'+(binds.length?`，已绑定 ${binds.length} 个节点`:''),1);loadOut();loadIn();refresh()}else msg(r.msg)}
+
+async function speedAll(){const l=await api('/outbounds');
+ if(!l.length)return msg('暂无出站');
+ msg(`开始测延迟 ${l.length} 个出站…`,1);
+ for(const o of l)speedOut(encodeURIComponent(o.tag));}
+async function speedOut(t0){const t=decodeURIComponent(t0);
+ const box=document.getElementById('sp-'+t);
+ if(box)box.innerHTML='<span class="spin"></span> 启动…';
+ await api('/speedtest/'+encodeURIComponent(t));
+ for(let i=0;i<20;i++){
+   await new Promise(r=>setTimeout(r,1500));
+   let s;try{s=await api('/speed-status/'+encodeURIComponent(t))}catch(e){return}
+   const b=document.getElementById('sp-'+t);if(!b)return;
+   if(s.running){b.innerHTML=`<span class="spin"></span> ${esc(s.step||'测试中')}`;continue}
+   if(s.ok===true){
+     const col=s.latency<=100?'#3ddc84':(s.latency<=250?'#f0c674':'#ff8080');
+     b.innerHTML=`<b style="color:${col}">${s.latency}ms</b>`
+       +(s.best!==s.latency?` <i style="color:#6b7280;font-style:normal;font-size:12px">最快 ${s.best}ms</i>`:'')
+       +(s.loss?` <span style="color:#ff8080;font-size:12px">丢包 ${s.loss}%</span>`:'')
+       +(s.ip?` <i style="color:#6b7280;font-style:normal;font-size:12px">${esc(s.ip)}</i>`:'');
+     return}
+   if(s.ok===false){b.innerHTML=`<span style="color:#ff8080">${esc(s.msg)}</span>`;return}
+ }
+ const b=document.getElementById('sp-'+t);if(b)b.textContent='超时';}
+async function editOut(t0){const t=decodeURIComponent(t0);
+ const d=await api('/outbound-detail/'+encodeURIComponent(t));
+ if(!d.ok)return msg(d.msg||'读取失败');
+ document.getElementById('mbox').innerHTML=`<h2>编辑出站 · ${esc(t)}</h2>
+  <p style="color:#8b93a1;font-size:12px;margin-bottom:6px">改名后节点绑定会自动跟随</p>
+  ${obForm(d)}
+  <div class="acts"><button onclick="saveEditOut('${encodeURIComponent(t)}')">保存</button>
+  <button class="btn2" onclick="closeM()">取消</button></div>`;
+ document.getElementById('modal').classList.add('show');onKindChange()}
+
+async function saveEditOut(t0){const t=decodeURIComponent(t0);
+ const r=await api('/outbound-edit/'+encodeURIComponent(t),'POST',obPayload());
+ if(r.ok){closeM();msg('已保存',1);loadOut();loadIn()}else msg(r.msg)}
+
 async function delOut(t0){const t=decodeURIComponent(t0);if(!confirm('删除出站 '+t+'?'))return;const r=await api('/outbounds/'+encodeURIComponent(t),'DELETE');
  if(r.ok){msg('已删除',1);loadOut();loadIn()}else msg(r.msg)}
 async function testOut(t0){const t=decodeURIComponent(t0);(document.getElementById('t-'+t)||{}).textContent='测试中…';const r=await api('/test/'+encodeURIComponent(t));
@@ -1759,6 +2031,14 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(200, dict(CERT_JOB))
         if p == "/api/version-status":
             return self._send(200, dict(VER_JOB))
+        if p.startswith("/api/speedtest/"):
+            t = urllib.parse.unquote(p[len("/api/speedtest/"):])
+            if not SPEED_JOB.get(t, {}).get("running"):
+                speedtest_async(t)
+            return self._send(200, {"ok": True, "started": True})
+        if p.startswith("/api/speed-status/"):
+            t = urllib.parse.unquote(p[len("/api/speed-status/"):])
+            return self._send(200, dict(SPEED_JOB.get(t, {})))
         with LOCK:
             if p == "/api/status":
                 return self._send(200, api_status())
@@ -1768,6 +2048,32 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(200, api_inbounds())
             if p == "/api/outbounds":
                 return self._send(200, api_outbounds())
+            if p.startswith("/api/outbound-detail/"):
+                t = urllib.parse.unquote(p[len("/api/outbound-detail/"):])
+                o = next((x for x in cfg().get("outbounds", []) if x.get("tag") == t), None)
+                if not o:
+                    return self._send(200, {"ok": False, "msg": "出站不存在"})
+                return self._send(200, {"ok": True, "tag": t,
+                                        "kind": o.get("type", "socks"),
+                                        "server": o.get("server", ""),
+                                        "port": o.get("server_port", ""),
+                                        "username": o.get("username", ""),
+                                        "password": o.get("password", ""),
+                                        "version": str(o.get("version", "5")),
+                                        "network": o.get("network", ""),
+                                        "tls": bool((o.get("tls") or {}).get("enabled")),
+                                        "uot": bool(o.get("udp_over_tcp"))})
+            if p.startswith("/api/inbound-detail/"):
+                t = urllib.parse.unquote(p[len("/api/inbound-detail/"):])
+                info = meta().get(t, {})
+                ib = next((i for i in cfg().get("inbounds", []) if i.get("tag") == t), None)
+                if not ib:
+                    return self._send(200, {"ok": False, "msg": "节点不存在"})
+                return self._send(200, {"ok": True, "tag": t,
+                                        "proto": info.get("proto", ""),
+                                        "fields": info.get("fields"),
+                                        "port": ib.get("listen_port"),
+                                        "name": info.get("name", t)})
             if p == "/api/certs":
                 pc = load_json(PANEL_CFG, {})
                 return self._send(200, {"certs": list_certs(),
@@ -1863,6 +2169,14 @@ class Handler(BaseHTTPRequestHandler):
             if p == "/api/outbounds":
                 okk, r = api_add_outbound(b)
                 return self._send(200, {"ok": okk, "msg": r if not okk else ""})
+            if p.startswith("/api/outbound-edit/"):
+                t = urllib.parse.unquote(p[len("/api/outbound-edit/"):])
+                okk, r = api_edit_outbound(t, b)
+                return self._send(200, {"ok": okk, "msg": r if not okk else "已保存"})
+            if p.startswith("/api/inbound-edit/"):
+                t = urllib.parse.unquote(p[len("/api/inbound-edit/"):])
+                okk, r = api_edit_inbound(t, b)
+                return self._send(200, {"ok": okk, "msg": r if not okk else "已保存"})
             if p == "/api/bind":
                 okk, r = api_bind(b.get("inbound"), b.get("outbound"))
                 return self._send(200, {"ok": okk, "msg": r})
@@ -1888,6 +2202,46 @@ class Handler(BaseHTTPRequestHandler):
                     return self._send(200, {"ok": False, "msg": "已有升级任务进行中"})
                 install_version_async(ver)
                 return self._send(200, {"ok": True, "async": True})
+            if p == "/api/sub-token":
+                pc = load_json(PANEL_CFG, {})
+                nt = (b.get("token") or "").strip()
+                if nt:
+                    if not re.match(r"^[A-Za-z0-9_-]{8,64}$", nt):
+                        return self._send(200, {"ok": False,
+                                                "msg": "token 需为 8-64 位字母/数字/-/_"})
+                else:
+                    nt = secrets.token_hex(16)
+                old = pc.get("sub_token", "")
+                pc["sub_token"] = nt
+                save_json(PANEL_CFG, pc)
+                if old:
+                    sh(f"rm -f '{SUB_DIR}/{old}' 2>/dev/null")
+                rebuild_sub()
+                sp = pc.get("sub_port", 8080)
+                dom = pc.get("tls_domain", "")
+                url = (f"https://{dom}:{sp}/{nt}" if dom
+                       else f"http://{public_ip()}:{sp}/{nt}")
+                return self._send(200, {"ok": True, "token": nt, "url": url,
+                                        "msg": "订阅地址已更换，旧地址立即失效"})
+
+            if p == "/api/panel-path":
+                pc = load_json(PANEL_CFG, {})
+                np = (b.get("path") or "").strip().strip("/")
+                if np and not re.match(r"^[A-Za-z0-9_-]{4,64}$", np):
+                    return self._send(200, {"ok": False,
+                                            "msg": "路径需为 4-64 位字母/数字/-/_，或留空取消"})
+                if b.get("random"):
+                    np = secrets.token_hex(8)
+                pc["path"] = np
+                save_json(PANEL_CFG, pc)
+                port = pc.get("port", 2095)
+                dom = pc.get("tls_domain", "")
+                host = dom or (public_ip() if pc.get("host") == "0.0.0.0" else pc.get("host", "127.0.0.1"))
+                sch = "https" if dom else "http"
+                newurl = f"{sch}://{host}:{port}" + (f"/{np}" if np else "")
+                return self._send(200, {"ok": True, "path": np, "url": newurl,
+                                        "msg": "路径已更换，请用新地址访问"})
+
             if p == "/api/auto-update":
                 pc = load_json(PANEL_CFG, {})
                 pc["auto_update"] = {

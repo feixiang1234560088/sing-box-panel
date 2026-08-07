@@ -639,8 +639,12 @@ Environment=HOME=/root
 Environment=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 WorkingDirectory=/root
 ExecStart=$(command -v python3) $PANEL_PY
-Restart=on-failure
+Restart=always
 RestartSec=5s
+StartLimitIntervalSec=0
+# 内存超限时只重启，不让 OOM killer 连累 sing-box
+MemoryMax=120M
+OOMPolicy=continue
 
 [Install]
 WantedBy=multi-user.target

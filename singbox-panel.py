@@ -749,23 +749,41 @@ def fetch_versions(limit=5):
     return out
 
 
-def install_version(ver):
+VER_JOB = {"running": False, "ver": "", "ok": None, "msg": "", "step": ""}
+
+
+def install_version(ver, job=None):
+    def step(t):
+        if job is not None:
+            job["step"] = t
+
     ver = ver.lstrip("v").strip()
     if not re.match(r"^[0-9][0-9A-Za-z.\-]*$", ver):
         return False, "版本号格式无效"
     arch = get_arch()
     pkg = f"sing-box-{ver}-linux-{arch}"
-    url = f"https://github.com/SagerNet/sing-box/releases/download/v{ver}/{pkg}.tar.gz"
+    gh = f"https://github.com/SagerNet/sing-box/releases/download/v{ver}/{pkg}.tar.gz"
+    mirrors = [gh,
+               f"https://ghfast.top/{gh}",
+               f"https://gh-proxy.com/{gh}"]
     tmp = f"/tmp/sbup-{secrets.token_hex(4)}"
     os.makedirs(tmp, exist_ok=True)
     try:
-        c, o, e = sh(f"curl -fsSL --max-time 180 '{url}' -o {tmp}/sb.tar.gz", 190)
-        if c != 0:
-            return False, f"下载失败（版本可能不存在或网络不通）\n{url}"
+        okdl = False
+        for i, url in enumerate(mirrors):
+            step(f"下载中 ({'官方源' if i == 0 else '镜像 ' + str(i)})")
+            c, o, e = sh(f"curl -fsSL --max-time 120 --retry 1 '{url}' -o {tmp}/sb.tar.gz", 130)
+            if c == 0 and os.path.getsize(f"{tmp}/sb.tar.gz") > 1000000:
+                okdl = True
+                break
+        if not okdl:
+            return False, f"下载失败（版本不存在或服务器连不上 GitHub）\n{gh}"
+        step("解压中")
         c, _, e = sh(f"tar -xzf {tmp}/sb.tar.gz -C {tmp}")
         if c != 0 or not os.path.exists(f"{tmp}/{pkg}/sing-box"):
             return False, "解压失败或包结构异常"
 
+        step("备份并安装")
         bak = f"{SB_BIN}.bak.{int(time.time())}"
         if os.path.exists(SB_BIN):
             sh(f"cp {SB_BIN} {bak}")
@@ -775,7 +793,7 @@ def install_version(ver):
             sh("systemctl start sing-box")
             return False, f"安装失败: {e}"
 
-        # 新版本校验现有配置
+        step("校验配置")
         c, o, e = sh(f"{SB_BIN} check -c {SB_CONF}")
         if c != 0:
             if os.path.exists(bak):
@@ -783,6 +801,7 @@ def install_version(ver):
             sh("systemctl start sing-box")
             return False, f"新版本无法加载当前配置，已回滚:\n{(e or o)[:400]}"
 
+        step("启动服务")
         sh("systemctl start sing-box")
         time.sleep(1)
         _, st, _ = sh("systemctl is-active sing-box")
@@ -798,6 +817,19 @@ def install_version(ver):
         return True, cur_version()
     finally:
         sh(f"rm -rf {tmp}")
+
+
+def install_version_async(ver):
+    def work():
+        VER_JOB.update(running=True, ver=ver, ok=None, msg="", step="准备")
+        try:
+            okk, r = install_version(ver, VER_JOB)
+            VER_JOB.update(ok=okk, msg=(f"已切换到 {r}" if okk else r))
+        except Exception as e:
+            VER_JOB.update(ok=False, msg=f"异常: {e}")
+        finally:
+            VER_JOB.update(running=False, step="")
+    threading.Thread(target=work, daemon=True).start()
 
 
 # ════════════════════════════════════════════
@@ -1234,9 +1266,26 @@ async function loadVer(){const box=document.getElementById('verbox');
 async function doInstall(v){const r0=await api('/versions');
  if(r0.pinned&&r0.pinned!==v&&!confirm(`当前锁定在 ${r0.pinned}，确定切换到 ${v}？`))return;
  if(!confirm(`切换到 sing-box ${v}？\n\n会自动备份当前版本，若新版本无法加载配置将自动回滚。`))return;
- msg('正在下载安装，请稍候…',1);
  const r=await api('/install-version','POST',{version:v});
- if(r.ok){msg(r.msg,1);loadVer();refresh()}else alert(r.msg)}
+ if(!r.ok){alert(r.msg);return}
+ document.getElementById('mbox').innerHTML=`<h2>切换到 ${esc(v)}</h2>
+  <div id="vstat" class="alert" style="background:#1a1d23;border-color:#2c313a;color:#8b93a1">
+    <span class="spin"></span> 准备中…</div>
+  <div class="acts"><button class="btn2" onclick="closeM()">后台运行，关闭窗口</button></div>`;
+ document.getElementById('modal').classList.add('show');
+ pollVer()}
+async function pollVer(){
+ for(let i=0;i<120;i++){
+   await new Promise(r=>setTimeout(r,2000));
+   let s;try{s=await api('/version-status')}catch(e){return}
+   const box=document.getElementById('vstat');if(!box)return;
+   if(s.running){box.innerHTML=`<span class="spin"></span> ${esc(s.step||'处理中')}… (${(i+1)*2}s)`;continue}
+   if(s.ok===true){box.style.cssText='background:#16241c;border-color:#2d7f4f;color:#8ff0b5';
+     box.textContent='✓ '+s.msg;loadVer();refresh();setTimeout(closeM,1500);return}
+   if(s.ok===false){box.style.cssText='';
+     box.innerHTML='✗ '+esc(s.msg).replace(/\n/g,'<br>');return}
+ }
+ const box=document.getElementById('vstat');if(box)box.textContent='超时，请查看日志';}
 function manualVer(){document.getElementById('mbox').innerHTML=`<h2>手动指定版本</h2>
  <label>版本号（不带 v 前缀）</label><input id="mv" placeholder="1.14.0-beta.7">
  <div class="acts"><button onclick="(async()=>{const v=document.getElementById('mv').value.trim();if(!v)return;closeM();doInstall(v)})()">安装</button>
@@ -1418,6 +1467,8 @@ class Handler(BaseHTTPRequestHandler):
         # 证书任务状态：不加锁，避免申请期间面板卡死
         if p == "/api/cert-status":
             return self._send(200, dict(CERT_JOB))
+        if p == "/api/version-status":
+            return self._send(200, dict(VER_JOB))
         with LOCK:
             if p == "/api/status":
                 return self._send(200, api_status())
@@ -1531,9 +1582,10 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(200, {"ok": c == 0})
             if p == "/api/install-version":
                 ver = (b.get("version") or "").strip()
-                okk, r = install_version(ver)
-                return self._send(200, {"ok": okk,
-                                        "msg": r if not okk else f"已切换到 {r}"})
+                if VER_JOB["running"]:
+                    return self._send(200, {"ok": False, "msg": "已有升级任务进行中"})
+                install_version_async(ver)
+                return self._send(200, {"ok": True, "async": True})
             if p == "/api/pin-version":
                 if b.get("pin"):
                     with open(VER_PIN, "w") as fh:

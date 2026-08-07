@@ -769,26 +769,54 @@ def install_version(ver, job=None):
     tmp = f"/tmp/sbup-{secrets.token_hex(4)}"
     os.makedirs(tmp, exist_ok=True)
     try:
+        # 磁盘空间预检（下载 ~30MB + 解压 ~95MB）
+        c, o, _ = sh(f"df -Pm {os.path.dirname(tmp)} | tail -1 | awk '{{print $4}}'")
+        try:
+            freemb = int(o.strip())
+            if freemb < 200:
+                return False, (f"磁盘空间不足：/tmp 仅剩 {freemb}MB，需要至少 200MB\n"
+                               f"可清理后重试： rm -rf /tmp/sbup-* ; apt-get clean")
+        except ValueError:
+            pass
+
         okdl = False
+        lasterr = ""
         for i, url in enumerate(mirrors):
             step(f"下载中 ({'官方源' if i == 0 else '镜像 ' + str(i)})")
-            c, o, e = sh(f"curl -fsSL --max-time 120 --retry 1 '{url}' -o {tmp}/sb.tar.gz", 130)
-            if c == 0 and os.path.getsize(f"{tmp}/sb.tar.gz") > 1000000:
-                okdl = True
-                break
+            sh(f"rm -f {tmp}/sb.tar.gz")
+            c, o, e = sh(f"curl -fL --max-time 180 --retry 2 --retry-delay 2 "
+                         f"-w '%{{http_code}}' -o {tmp}/sb.tar.gz '{url}'", 200)
+            sz = os.path.getsize(f"{tmp}/sb.tar.gz") if os.path.exists(f"{tmp}/sb.tar.gz") else 0
+            if c != 0:
+                lasterr = f"curl 失败({e or o})"; continue
+            if sz < 5 * 1024 * 1024:
+                lasterr = f"文件过小 {sz//1024}KB（可能是错误页或下载中断）"; continue
+            # 完整性校验：gzip 校验和
+            cz, _, ez = sh(f"gzip -t {tmp}/sb.tar.gz", 60)
+            if cz != 0:
+                lasterr = f"文件损坏/下载不完整（{sz//1024//1024}MB，gzip 校验失败）"; continue
+            okdl = True
+            break
         if not okdl:
-            return False, f"下载失败（版本不存在或服务器连不上 GitHub）\n{gh}"
+            return False, f"下载失败：{lasterr}\n{gh}"
+
         step("解压中")
-        c, _, e = sh(f"tar -xzf {tmp}/sb.tar.gz -C {tmp}")
-        if c != 0 or not os.path.exists(f"{tmp}/{pkg}/sing-box"):
-            return False, "解压失败或包结构异常"
+        c, o, e = sh(f"tar -xzf {tmp}/sb.tar.gz -C {tmp}", 120)
+        if c != 0:
+            return False, f"解压失败：{(e or o)[:300]}"
+        # 不假设目录名，直接找二进制
+        c, found, _ = sh(f"find {tmp} -type f -name sing-box -perm -u+x | head -1")
+        binsrc = found.strip()
+        if not binsrc:
+            _, lst, _ = sh(f"ls -R {tmp} | head -20")
+            return False, f"包内未找到 sing-box 可执行文件\n{lst[:300]}"
 
         step("备份并安装")
         bak = f"{SB_BIN}.bak.{int(time.time())}"
         if os.path.exists(SB_BIN):
             sh(f"cp {SB_BIN} {bak}")
         sh("systemctl stop sing-box")
-        c, _, e = sh(f"install -m 755 {tmp}/{pkg}/sing-box {SB_BIN}")
+        c, _, e = sh(f"install -m 755 {binsrc} {SB_BIN}")
         if c != 0:
             sh("systemctl start sing-box")
             return False, f"安装失败: {e}"

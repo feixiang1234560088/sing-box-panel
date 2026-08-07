@@ -642,8 +642,9 @@ ExecStart=$(command -v python3) $PANEL_PY
 Restart=always
 RestartSec=5s
 StartLimitIntervalSec=0
-# 内存超限时只重启，不让 OOM killer 连累 sing-box
-MemoryMax=120M
+# 软限制：超了先回收页缓存而不是直接杀（解压升级包时会用到大量页缓存）
+MemoryHigh=200M
+MemoryMax=400M
 OOMPolicy=continue
 
 [Install]

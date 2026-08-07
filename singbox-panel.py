@@ -577,6 +577,37 @@ PROTOCOLS = {
             {"k": "cert", "l": "证书域名", "t": "cert"},
         ],
     },
+    "snell": {
+        "label": "Snell v4", "needs_cert": False,
+        "fields": [
+            {"k": "name", "l": "节点名称", "t": "text", "d": "节点-snell"},
+            {"k": "port", "l": "监听端口", "t": "number", "auto": "port"},
+            {"k": "psk", "l": "PSK 密钥", "t": "text", "auto": "pass"},
+            {"k": "obfs", "l": "混淆", "t": "select", "opts": ["关闭", "http", "tls"], "d": "关闭"},
+            {"k": "server", "l": "客户端连接地址", "t": "text", "auto": "ip"},
+        ],
+    },
+    "mixed": {
+        "label": "Mixed (SOCKS+HTTP)", "needs_cert": False,
+        "fields": [
+            {"k": "name", "l": "节点名称", "t": "text", "d": "节点-mixed"},
+            {"k": "port", "l": "监听端口", "t": "number", "auto": "port"},
+            {"k": "user", "l": "用户名 (留空=无认证)", "t": "text", "d": "user"},
+            {"k": "password", "l": "密码", "t": "text", "auto": "pass"},
+            {"k": "server", "l": "客户端连接地址", "t": "text", "auto": "ip"},
+        ],
+    },
+    "http": {
+        "label": "HTTP 代理", "needs_cert": False,
+        "fields": [
+            {"k": "name", "l": "节点名称", "t": "text", "d": "节点-http"},
+            {"k": "port", "l": "监听端口", "t": "number", "auto": "port"},
+            {"k": "user", "l": "用户名 (留空=无认证)", "t": "text", "d": "user"},
+            {"k": "password", "l": "密码", "t": "text", "auto": "pass"},
+            {"k": "cert", "l": "证书域名 (留空=明文HTTP)", "t": "cert"},
+            {"k": "server", "l": "客户端连接地址", "t": "text", "auto": "ip"},
+        ],
+    },
     "socks": {
         "label": "SOCKS5", "needs_cert": False,
         "fields": [
@@ -742,6 +773,40 @@ def build_inbound(proto, f, tag):
               "tls": {"enabled": True, "server_name": domain,
                       "certificate_path": cp, "key_path": kp}}
         uri = f"naive+https://{uenc(f['user'])}:{uenc(f['password'])}@{domain}:{port}#{uenc(name)}"
+
+    elif proto == "snell":
+        srv = f["server"]
+        ib = {"type": "snell", "tag": tag, "listen": "::", "listen_port": port,
+              "users": [{"psk": f["psk"]}], "version": 4}
+        ob = f.get("obfs", "关闭")
+        q = ""
+        if ob != "关闭":
+            ib["obfs"] = {"type": ob}
+            q = f"&obfs={ob}"
+        uri = f"snell://{uenc(f['psk'])}@{srv}:{port}?version=4{q}#{uenc(name)}"
+
+    elif proto == "mixed":
+        srv = f["server"]
+        ib = {"type": "mixed", "tag": tag, "listen": "::", "listen_port": port}
+        if f.get("user"):
+            ib["users"] = [{"username": f["user"], "password": f["password"]}]
+            uri = f"socks://{b64(f['user'] + ':' + f['password'])}@{srv}:{port}#{uenc(name)}"
+        else:
+            uri = f"socks5://{srv}:{port}#{uenc(name)}"
+
+    elif proto == "http":
+        srv = domain or f["server"]
+        ib = {"type": "http", "tag": tag, "listen": "::", "listen_port": port}
+        if f.get("user"):
+            ib["users"] = [{"username": f["user"], "password": f["password"]}]
+        if cert:
+            ib["tls"] = {"enabled": True, "server_name": domain,
+                         "certificate_path": cp, "key_path": kp}
+            scheme = "https"
+        else:
+            scheme = "http"
+        auth = f"{uenc(f['user'])}:{uenc(f['password'])}@" if f.get("user") else ""
+        uri = f"{scheme}://{auth}{srv}:{port}#{uenc(name)}"
 
     elif proto == "socks":
         srv = f["server"]
@@ -1038,9 +1103,15 @@ def api_inbounds():
 
 
 def api_outbounds():
-    return [{"tag": o.get("tag"), "type": o.get("type"),
-             "server": o.get("server", ""), "port": o.get("server_port", "")}
-            for o in cfg().get("outbounds", []) if o.get("type") != "direct"]
+    out = []
+    for o in cfg().get("outbounds", []):
+        if o.get("type") == "direct":
+            continue
+        out.append({"tag": o.get("tag"), "type": o.get("type"),
+                    "server": o.get("server", ""), "port": o.get("server_port", ""),
+                    "auth": bool(o.get("username")),
+                    "tls": bool((o.get("tls") or {}).get("enabled"))})
+    return out
 
 
 def api_add_inbound(body):
@@ -1116,7 +1187,9 @@ def api_del_inbound(tag):
 def api_add_outbound(body):
     raw = (body.get("raw") or "").strip()
     tag = (body.get("tag") or "").strip()
-    binds = body.get("binds") or []          # 要绑定到此出站的入站 tag 列表
+    kind = body.get("kind", "socks")          # socks | http
+    tls_on = bool(body.get("tls"))            # HTTP 出站是否走 HTTPS
+    binds = body.get("binds") or []
     parts = raw.split(":")
     if len(parts) < 2:
         return False, "格式应为 ip:端口:账号:密码 (无认证可省略后两段)"
@@ -1130,10 +1203,16 @@ def api_add_outbound(body):
     c = cfg()
     if any(o.get("tag") == tag for o in c.get("outbounds", [])):
         return False, f"出站名 {tag} 已存在"
-    ob = {"type": "socks", "tag": tag, "server": ip, "server_port": int(port),
-          "version": "5"}
-    if body.get("uot"):
-        ob["udp_over_tcp"] = True      # UDP over TCP（需落地支持 UoT）
+
+    if kind == "http":
+        ob = {"type": "http", "tag": tag, "server": ip, "server_port": int(port)}
+        if tls_on:
+            ob["tls"] = {"enabled": True, "server_name": ip, "insecure": True}
+    else:
+        ob = {"type": "socks", "tag": tag, "server": ip, "server_port": int(port),
+              "version": "5"}
+        if body.get("uot"):
+            ob["udp_over_tcp"] = True      # UDP over TCP（需落地支持 UoT）
     if user:
         ob["username"] = user
         ob["password"] = pw
@@ -1151,7 +1230,7 @@ def api_add_outbound(body):
         new_rules = []
         # QUIC/UDP 走 SOCKS5 常不稳（落地多半不支持 UDP ASSOCIATE）
         # 默认把这些节点的 QUIC 拒掉，强制回退 TCP —— 显著更稳
-        if body.get("block_quic", True):
+        if kind == "http" or body.get("block_quic", True):
             new_rules.append({"inbound": binds, "protocol": "quic", "action": "reject"})
         new_rules += [{"inbound": [b], "outbound": tag} for b in binds]
         c["route"]["rules"] = head + new_rules + tail
@@ -1192,7 +1271,12 @@ def api_test_outbound(tag):
     auth = ""
     if o.get("username"):
         auth = f"{o['username']}:{o.get('password','')}@"
-    c, out, _ = sh(f"curl -s --max-time 10 --socks5-hostname {auth}{srv}:{port} https://api.ipify.org", 15)
+    if o.get("type") == "http":
+        sch = "https" if (o.get("tls") or {}).get("enabled") else "http"
+        proxy = f"-x {sch}://{auth}{srv}:{port}" + (" --proxy-insecure" if sch == "https" else "")
+    else:
+        proxy = f"--socks5-hostname {auth}{srv}:{port}"
+    c, out, _ = sh(f"curl -s --max-time 10 {proxy} https://api.ipify.org", 15)
     if c == 0 and out.strip():
         return {"ok": True, "msg": f"可用 · 出口 IP {out.strip()}"}
     c2, _, _ = sh(f"timeout 5 bash -c '</dev/tcp/{srv}/{port}'")
@@ -1293,7 +1377,7 @@ pre{background:#0f1114;padding:12px;border-radius:8px;overflow:auto;font-size:12
   <div class="tab" data-t="log" onclick="tab('log')">日志</div>
 </div>
 <div id="v-in"><div class="acts" style="margin-bottom:14px"><button onclick="newNode()">+ 添加节点</button></div><div id="inlist" class="grid"></div></div>
-<div id="v-out" style="display:none"><div class="acts" style="margin-bottom:14px"><button onclick="newOut()">+ 添加 SOCKS5 出站</button></div><div id="outlist" class="grid"></div></div>
+<div id="v-out" style="display:none"><div class="acts" style="margin-bottom:14px"><button onclick="newOut()">+ 添加出站代理</button></div><div id="outlist" class="grid"></div></div>
 <div id="v-cert" style="display:none"><div class="acts" style="margin-bottom:14px"><button onclick="newCert()">+ 申请证书</button></div><div id="certlist" class="grid"></div></div>
 <div id="v-sub" style="display:none"><div class="card"><h3>订阅链接</h3>
  <div class="uri" id="suburl" onclick="cp(this.textContent)"></div>
@@ -1333,6 +1417,7 @@ async function loadOut(){OUTS=await api('/outbounds');
  document.getElementById('outlist').innerHTML=OUTS.length?OUTS.map(o=>`<div class="card"><h3>${esc(o.tag)}<span class="badge">${o.type}</span></h3>
   <div class="row"><span>地址</span><span>${o.server}</span></div>
   <div class="row"><span>端口</span><span>${o.port}</span></div>
+  <div class="row"><span>协议</span><span>${o.type==='http'?(o.tls?'HTTPS':'HTTP'):'SOCKS5'}${o.auth?' · 已认证':' · 无认证'}</span></div>
   <div class="row"><span>状态</span><span id="t-${esc(o.tag)}">-</span></div>
   <div class="acts"><button class="btn2" onclick="testOut('${encodeURIComponent(o.tag)}')">测试</button>
   <button class="btnd" onclick="delOut('${encodeURIComponent(o.tag)}')">删除</button></div></div>`).join(''):'<div class="empty">暂无出站，节点走本机直连</div>'}
@@ -1513,25 +1598,47 @@ async function newOut(){const nodes=await api('/inbounds');
  const list=nodes.length?nodes.map(n=>`<label class="chk"><input type="checkbox" class="nd" value="${n.tag}">
    <span>${esc(n.name)} <i>${n.type} · ${n.port}</i>${n.bind!=='direct'?`<em>当前: ${esc(n.bind)}</em>`:''}</span></label>`).join('')
    :'<div style="color:#5a626e;font-size:13px;padding:6px 0">还没有节点</div>';
- document.getElementById('mbox').innerHTML=`<h2>添加 SOCKS5 出站</h2>
+ document.getElementById('mbox').innerHTML=`<h2>添加出站代理</h2>
+ <label>代理类型</label>
+ <select id="o-kind" onchange="onKindChange()">
+   <option value="socks">SOCKS5（支持 UDP，推荐）</option>
+   <option value="http">HTTP / HTTPS（仅 TCP）</option>
+ </select>
+ <label class="chk" id="o-tlsrow" style="display:none;margin:6px 0"><input type="checkbox" id="o-tls">
+   <span>使用 HTTPS 连接落地 <i>落地需支持 TLS</i></span></label>
  <label>落地信息 (ip:端口:账号:密码，无认证可省略后两段)</label><input id="o-raw" placeholder="1.2.3.4:1080:user:pass">
  <label>出站名称 (可留空自动生成)</label><input id="o-tag" placeholder="landing-1">
  <label>绑定节点 (可多选，选中的节点全部流量走此出站)
    ${nodes.length?'<a href="javascript:;" onclick="allNd(1)">全选</a> / <a href="javascript:;" onclick="allNd(0)">清空</a>':''}</label>
  <div class="chkbox">${list}</div>
- <label style="margin-top:14px">UDP 处理 <i style="color:#6b7280;font-style:normal;font-size:12px">(多数 SOCKS5 落地不支持 UDP，这是 hy2 走出站变慢的主因)</i></label>
+ <div id="o-udpbox">
+ <label style="margin-top:14px">UDP 处理 <i style="color:#6b7280;font-style:normal;font-size:12px">(多数落地不支持 UDP，这是 hy2 走出站变慢的主因)</i></label>
  <label class="chk" style="margin:4px 0"><input type="checkbox" id="o-blockquic" checked>
    <span>拒绝 QUIC，强制走 TCP <i>推荐 · 显著更稳</i></span></label>
  <label class="chk" style="margin:0"><input type="checkbox" id="o-uot">
    <span>UDP over TCP <i>仅当落地支持 UoT 时勾选</i></span></label>
+ </div>
  <div class="acts"><button onclick="saveOut()">添加</button><button class="btn2" onclick="closeM()">取消</button></div>`;
  document.getElementById('modal').classList.add('show')}
 function allNd(v){document.querySelectorAll('.nd').forEach(e=>e.checked=!!v)}
+function onKindChange(){const k=document.getElementById('o-kind').value;
+ document.getElementById('o-tlsrow').style.display=k==='http'?'flex':'none';
+ const ub=document.getElementById('o-udpbox');
+ if(k==='http'){ub.innerHTML='<div class="alert" style="margin-top:14px">HTTP 代理不支持 UDP，QUIC 将自动拒绝并回退 TCP</div>'}
+ else if(!document.getElementById('o-blockquic')){ub.innerHTML=`
+   <label style="margin-top:14px">UDP 处理</label>
+   <label class="chk" style="margin:4px 0"><input type="checkbox" id="o-blockquic" checked>
+     <span>拒绝 QUIC，强制走 TCP <i>推荐 · 显著更稳</i></span></label>
+   <label class="chk" style="margin:0"><input type="checkbox" id="o-uot">
+     <span>UDP over TCP <i>仅当落地支持 UoT 时勾选</i></span></label>`}}
 async function saveOut(){const binds=[...document.querySelectorAll('.nd:checked')].map(e=>e.value);
- const r=await api('/outbounds','POST',{raw:document.getElementById('o-raw').value,
-   tag:document.getElementById('o-tag').value,binds:binds,
-   uot:document.getElementById('o-uot').checked,
-   block_quic:document.getElementById('o-blockquic').checked});
+ const k=document.getElementById('o-kind').value;
+ const g=id=>document.getElementById(id);
+ const r=await api('/outbounds','POST',{raw:g('o-raw').value,
+   tag:g('o-tag').value,binds:binds,kind:k,
+   tls:k==='http'&&g('o-tls')?g('o-tls').checked:false,
+   uot:g('o-uot')?g('o-uot').checked:false,
+   block_quic:g('o-blockquic')?g('o-blockquic').checked:true});
  if(r.ok){closeM();msg('出站已添加'+(binds.length?`，已绑定 ${binds.length} 个节点`:''),1);loadOut();loadIn();refresh()}else msg(r.msg)}
 async function delOut(t0){const t=decodeURIComponent(t0);if(!confirm('删除出站 '+t+'?'))return;const r=await api('/outbounds/'+encodeURIComponent(t),'DELETE');
  if(r.ok){msg('已删除',1);loadOut();loadIn()}else msg(r.msg)}

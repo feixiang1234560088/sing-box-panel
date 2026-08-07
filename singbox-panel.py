@@ -1167,6 +1167,96 @@ def setup_hop(rng, target):
        "netfilter-persistent save >/dev/null 2>&1", 60)
 
 
+def _cert_domain(path):
+    """/etc/sing-box/cert/DOMAIN/fullchain.pem -> DOMAIN"""
+    if not path:
+        return ""
+    p = path.rstrip("/").split("/")
+    return p[-2] if len(p) >= 2 else ""
+
+
+def inbound_to_fields(ib, proto, info):
+    """从实际配置反推表单字段，使任何版本创建的节点都能编辑"""
+    f = {"name": info.get("name") or ib.get("tag", ""),
+         "port": str(ib.get("listen_port", ""))}
+    tls = ib.get("tls") or {}
+    users = ib.get("users") or [{}]
+    u0 = users[0] if users else {}
+    cert = _cert_domain(tls.get("certificate_path", ""))
+    if cert:
+        f["cert"] = cert
+    # 客户端连接地址：优先从已存链接里取，其次证书域名/公网IP
+    srv = ""
+    uri = info.get("uri", "")
+    m = re.search(r"@([^:/?#]+):", uri)
+    if m:
+        srv = m.group(1)
+    f["server"] = srv or cert or public_ip()
+
+    if proto == "hysteria2":
+        f["password"] = u0.get("password", "")
+        f["obfs"] = (ib.get("obfs") or {}).get("password", "")
+        f["up"] = str(ib.get("up_mbps", 0) or 0)
+        f["down"] = str(ib.get("down_mbps", 0) or 0)
+        mq = ib.get("masquerade")
+        if not mq:
+            f["masq_type"] = "不伪装(返回404)"
+        elif (mq or {}).get("type") == "proxy":
+            f["masq_type"] = "反代网站(内容最真实)"
+            f["masq"] = mq.get("url", "")
+        else:
+            f["masq_type"] = "内置页面(最快，不出网)"
+        mm = re.search(r"mport=([0-9\-]+)", uri)
+        f["hop"] = mm.group(1) if mm else ""
+    elif proto == "vless":
+        f["uuid"] = u0.get("uuid", "")
+        f["dest"] = tls.get("server_name", "")
+        f["flow"] = ("xtls-rprx-vision (推荐，性能最好)" if u0.get("flow") else "无")
+    elif proto in ("vless-tls", "vmess"):
+        f["uuid"] = u0.get("uuid", "")
+    elif proto in ("anytls", "trojan"):
+        f["password"] = u0.get("password", "")
+    elif proto == "tuic":
+        f["uuid"] = u0.get("uuid", "")
+        f["password"] = u0.get("password", "")
+        f["cc"] = ib.get("congestion_control", "bbr")
+        f["zrtt"] = "开启" if ib.get("zero_rtt_handshake") else "关闭"
+    elif proto == "hysteria":
+        f["authstr"] = u0.get("auth_str", "")
+        f["up"] = str(ib.get("up_mbps", 50))
+        f["down"] = str(ib.get("down_mbps", 200))
+    elif proto == "shadowtls":
+        f["password"] = u0.get("password", "")
+        f["dest"] = (ib.get("handshake") or {}).get("server", "")
+        det = ib.get("detour", "")
+        ss = next((x for x in cfg().get("inbounds", []) if x.get("tag") == det), {})
+        f["sspass"] = ss.get("password", "")
+    elif proto == "naive":
+        f["user"] = u0.get("username", "")
+        f["password"] = u0.get("password", "")
+    elif proto == "snell":
+        f["psk"] = u0.get("psk", "")
+        f["obfs"] = (ib.get("obfs") or {}).get("type", "关闭") or "关闭"
+    elif proto in ("socks", "mixed", "http"):
+        f["user"] = u0.get("username", "")
+        f["password"] = u0.get("password", "")
+        if proto == "http" and not cert:
+            f["cert"] = ""
+    elif proto == "shadowsocks":
+        f["method"] = ib.get("method", "2022-blake3-aes-128-gcm")
+        f["password"] = ib.get("password", "")
+    return f
+
+
+def guess_proto(ib):
+    """无记录时从配置判断协议种类"""
+    t = ib.get("type")
+    tls = ib.get("tls") or {}
+    if t == "vless":
+        return "vless" if (tls.get("reality") or {}).get("enabled") else "vless-tls"
+    return t if t in PROTOCOLS else ""
+
+
 def api_edit_inbound(tag, body):
     c = cfg()
     old = next((i for i in c.get("inbounds", []) if i.get("tag") == tag), None)
@@ -1186,6 +1276,21 @@ def api_edit_inbound(tag, body):
         ib, uri = build_inbound(proto, f, tag)
     except Exception as e:
         return False, f"生成失败: {e}"
+    # Reality：dest 未变则沿用原密钥与 short_id，避免客户端全部失效
+    if proto == "vless":
+        oldr = ((old.get("tls") or {}).get("reality") or {})
+        newr = ((ib.get("tls") or {}).get("reality") or {})
+        same_dest = (old.get("tls") or {}).get("server_name") == (ib.get("tls") or {}).get("server_name")
+        if same_dest and oldr.get("private_key"):
+            newr["private_key"] = oldr["private_key"]
+            newr["short_id"] = oldr.get("short_id", newr.get("short_id"))
+            # 分享链接里的公钥同步回旧值
+            oldpub = re.search(r"pbk=([^&#]+)", info.get("uri", ""))
+            oldsid = re.search(r"sid=([^&#]+)", info.get("uri", ""))
+            if oldpub:
+                uri = re.sub(r"pbk=[^&#]+", f"pbk={oldpub.group(1)}", uri)
+            if oldsid:
+                uri = re.sub(r"sid=[^&#]+", f"sid={oldsid.group(1)}", uri)
     extra = ib.pop("_extra_inbound", None)
 
     # 原地替换，保持顺序；同时更新 ShadowTLS 的配套入站
@@ -1745,7 +1850,6 @@ function esc(s){return String(s).replace(/[<>&"]/g,c=>({'<':'&lt;','>':'&gt;','&
 async function editNode(t0){const t=decodeURIComponent(t0);
  const d=await api('/inbound-detail/'+encodeURIComponent(t));
  if(!d.ok)return msg(d.msg||'读取失败');
- if(!d.fields)return msg('该节点创建于旧版本，无法编辑，请删除后重建');
  const spec=PROTOS[d.proto];
  if(!spec)return msg('未知协议');
  document.getElementById('mbox').innerHTML=`<h2>编辑节点 · ${esc(d.name)}</h2>
@@ -2069,9 +2173,15 @@ class Handler(BaseHTTPRequestHandler):
                 ib = next((i for i in cfg().get("inbounds", []) if i.get("tag") == t), None)
                 if not ib:
                     return self._send(200, {"ok": False, "msg": "节点不存在"})
-                return self._send(200, {"ok": True, "tag": t,
-                                        "proto": info.get("proto", ""),
-                                        "fields": info.get("fields"),
+                proto = info.get("proto") or guess_proto(ib)
+                if proto not in PROTOCOLS:
+                    return self._send(200, {"ok": False,
+                                            "msg": f"暂不支持编辑该类型：{ib.get('type')}"})
+                fields = info.get("fields")
+                if not fields:
+                    fields = inbound_to_fields(ib, proto, info)   # 旧节点反推
+                return self._send(200, {"ok": True, "tag": t, "proto": proto,
+                                        "fields": fields,
                                         "port": ib.get("listen_port"),
                                         "name": info.get("name", t)})
             if p == "/api/certs":

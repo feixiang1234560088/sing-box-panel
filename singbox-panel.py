@@ -2203,15 +2203,17 @@ class Handler(BaseHTTPRequestHandler):
                 pc = load_json(PANEL_CFG, {})
                 m = meta()
                 uris = [v["uri"] for v in m.values() if v.get("uri")]
-                # 订阅已并入本进程：直接探测端口是否在监听
+                # 订阅已并入本进程：发一次真实请求判断（比探测端口可靠）
                 sp = int(pc.get("sub_port", 8080))
-                import socket as _sk
-                running = False
-                try:
-                    with _sk.create_connection(("127.0.0.1", sp), timeout=2):
-                        running = True
-                except OSError:
-                    running = False
+                _sch = "https" if pc.get("tls_domain") else "http"
+                _k = "-k " if _sch == "https" else ""
+                cc, code, _ = sh(f"curl -s -o /dev/null --max-time 4 {_k}"
+                                 f"-w '%{{http_code}}' {_sch}://127.0.0.1:{sp}/{tok}", 8)
+                running = code.strip() == "200"
+                if not running:   # 回退：看端口是否真的没在监听
+                    _, lsn, _ = sh(f"ss -ltn 2>/dev/null | grep -c ':{sp} '")
+                    if lsn.strip() not in ("0", ""):
+                        running = True   # 端口在听，只是本地请求失败，不算故障
                 # 仅当仍存在旧的独立服务文件时才提示迁移
                 legacy = os.path.exists("/etc/systemd/system/singbox-sub.service")
                 sdom = pc.get("tls_domain", "")

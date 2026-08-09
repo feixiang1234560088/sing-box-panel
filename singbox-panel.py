@@ -65,12 +65,26 @@ def meta():
     return load_json(META_FILE, {})
 
 
-def public_ip():
+_IP_CACHE = {"ip": "", "t": 0}
+
+
+def public_ip(force=False):
+    """带缓存的公网 IP。避免每次请求都跑 curl 拖住面板。"""
+    now = time.time()
+    if not force and _IP_CACHE["ip"] and now - _IP_CACHE["t"] < 3600:
+        return _IP_CACHE["ip"]
+    # 先试本地路由（瞬间返回，无网络请求）
+    c, o, _ = sh("ip -4 route get 1.1.1.1 2>/dev/null | grep -oP 'src \\K\\S+'", 3)
+    local = o.strip()
     for u in ("https://api.ipify.org", "https://ip.sb"):
-        c, o, _ = sh(f"curl -s4 --max-time 6 {u}")
-        if c == 0 and o:
-            return o.strip()
-    return "127.0.0.1"
+        c, o, _ = sh(f"curl -s4 --max-time 3 {u}", 5)
+        if c == 0 and o.strip():
+            _IP_CACHE.update(ip=o.strip(), t=now)
+            return _IP_CACHE["ip"]
+    # 取不到就用上次结果或本地地址，绝不阻塞
+    ip = _IP_CACHE["ip"] or local or "127.0.0.1"
+    _IP_CACHE.update(ip=ip, t=now)
+    return ip
 
 
 def rand_port():
@@ -319,6 +333,14 @@ def probe_dest(host, port=443, timeout=5):
                 r["ms"] = int((time.time() - t0) * 1000)
                 r["tls"] = ss.version() or ""
                 r["h2"] = (ss.selected_alpn_protocol() == "h2")
+                try:
+                    ci = ss.cipher() or ()
+                    r["cipher"] = ci[0] if ci else ""
+                    cert = ss.getpeercert() or {}
+                    iss = dict(x[0] for x in cert.get("issuer", []))
+                    r["issuer"] = iss.get("organizationName") or iss.get("commonName") or ""
+                except Exception:
+                    pass
                 # 合格条件: TLS1.3 + H2
                 r["ok"] = (r["tls"] == "TLSv1.3" and r["h2"])
                 if not r["ok"]:
@@ -494,6 +516,13 @@ PROTOCOLS = {
             {"k": "flow", "l": "流控", "t": "select",
              "opts": ["xtls-rprx-vision (推荐，性能最好)", "无"],
              "d": "xtls-rprx-vision (推荐，性能最好)"},
+            {"k": "regen", "l": "Reality 密钥", "t": "select",
+             "opts": ["保持现有密钥（编辑时推荐）", "重新生成密钥对"],
+             "d": "保持现有密钥（编辑时推荐）"},
+            {"k": "sid_count", "l": "Short ID 数量 (多个更难被特征匹配)", "t": "select",
+             "opts": ["8", "5", "3", "1"], "d": "8"},
+            {"k": "maxdiff", "l": "最大时间差 (防重放，0=关闭)", "t": "select",
+             "opts": ["0", "1m", "5m", "1h"], "d": "0"},
         ],
     },
     "anytls": {
@@ -688,7 +717,14 @@ def build_inbound(proto, f, tag):
 
     elif proto == "vless":
         priv, pub = gen_reality()
-        sid = secrets.token_hex(8)
+        # 多个 short_id：长度不一，更贴近真实分布
+        try:
+            n_sid = max(1, min(8, int(f.get("sid_count", 8))))
+        except (TypeError, ValueError):
+            n_sid = 8
+        lens = [8, 5, 4, 6, 3, 7, 2, 1][:n_sid]
+        sids = [secrets.token_hex(x) for x in lens]
+        sid = sids[0]
         dest = f["dest"]
         srv = f["server"]
         use_vision = not f.get("flow", "").startswith("无")
@@ -700,7 +736,10 @@ def build_inbound(proto, f, tag):
               "tls": {"enabled": True, "server_name": dest,
                       "reality": {"enabled": True,
                                   "handshake": {"server": dest, "server_port": 443},
-                                  "private_key": priv, "short_id": [sid]}}}
+                                  "private_key": priv, "short_id": sids}}}
+        md = str(f.get("maxdiff", "0")).strip()
+        if md and md != "0":
+            ib["tls"]["reality"]["max_time_difference"] = md
         uri = (f"vless://{f['uuid']}@{srv}:{port}?encryption=none&security=reality"
                f"&sni={dest}&fp=chrome&pbk={pub}&sid={sid}&type=tcp"
                + (f"&flow=xtls-rprx-vision" if use_vision else "")
@@ -1212,6 +1251,10 @@ def inbound_to_fields(ib, proto, info):
         f["uuid"] = u0.get("uuid", "")
         f["dest"] = tls.get("server_name", "")
         f["flow"] = ("xtls-rprx-vision (推荐，性能最好)" if u0.get("flow") else "无")
+        f["regen"] = "保持现有密钥（编辑时推荐）"
+        _r = (tls.get("reality") or {})
+        f["sid_count"] = str(len(_r.get("short_id") or [])) or "8"
+        f["maxdiff"] = _r.get("max_time_difference", "0") or "0"
     elif proto in ("vless-tls", "vmess"):
         f["uuid"] = u0.get("uuid", "")
     elif proto in ("anytls", "trojan"):
@@ -1276,12 +1319,13 @@ def api_edit_inbound(tag, body):
         ib, uri = build_inbound(proto, f, tag)
     except Exception as e:
         return False, f"生成失败: {e}"
-    # Reality：dest 未变则沿用原密钥与 short_id，避免客户端全部失效
+    # Reality：默认沿用原密钥；选了「重新生成」或 dest 变了才换新的
     if proto == "vless":
         oldr = ((old.get("tls") or {}).get("reality") or {})
         newr = ((ib.get("tls") or {}).get("reality") or {})
         same_dest = (old.get("tls") or {}).get("server_name") == (ib.get("tls") or {}).get("server_name")
-        if same_dest and oldr.get("private_key"):
+        want_regen = str(f.get("regen", "")).startswith("重新生成")
+        if same_dest and oldr.get("private_key") and not want_regen:
             newr["private_key"] = oldr["private_key"]
             newr["short_id"] = oldr.get("short_id", newr.get("short_id"))
             # 分享链接里的公钥同步回旧值
@@ -1478,7 +1522,9 @@ def speedtest_outbound(tag):
         px = _proxy_arg(o)
         url = "https://www.gstatic.com/generate_204"
 
-        lats = []
+        # time_connect = 到落地服务器的 TCP 握手耗时（与 3x-ui 口径一致）
+        # time_total   = 经落地访问目标站的完整往返，仅作参考
+        lats, totals = [], []
         for i in range(3):
             job["step"] = f"测试中 {i + 1}/3"
             c, out, _ = sh(f"curl -s -o /dev/null --max-time 8 {px} "
@@ -1486,7 +1532,8 @@ def speedtest_outbound(tag):
             try:
                 code, tc, tt = out.split()
                 if code in ("204", "200"):
-                    lats.append(float(tt) * 1000)
+                    lats.append(float(tc) * 1000)
+                    totals.append(float(tt) * 1000)
             except ValueError:
                 pass
         if not lats:
@@ -1495,11 +1542,13 @@ def speedtest_outbound(tag):
 
         avg = round(sum(lats) / len(lats))
         best = round(min(lats))
+        total = round(sum(totals) / len(totals)) if totals else 0
         # 顺带取出口 IP（失败不影响结果）
         _, ipout, _ = sh(f"curl -s --max-time 8 {px} https://api.ipify.org", 12)
         ip = ipout.strip()[:45]
 
         job.update(running=False, ok=True, latency=avg, best=best, ip=ip,
+                   total=total,
                    loss=round((3 - len(lats)) / 3 * 100),
                    msg=f"{avg}ms（最快 {best}ms）" + (f" · {ip}" if ip else ""))
     except Exception as e:
@@ -1891,7 +1940,9 @@ async function scanDest(){const box=document.getElementById('scanres');
  const r=await api('/scan');
  box.innerHTML=`<div class="scanlist">`+r.map(x=>{
    const cls=x.ok?'sok':'sbad';
-   const info=x.ok?`${x.ms}ms · TLS1.3 · H2`:(x.err||'不可用');
+   const info=x.ok
+     ?`${x.ms}ms · TLS1.3 · H2${x.issuer?' · '+esc(x.issuer):''}`
+     :(x.err||'不可用');
    return `<div class="scanrow ${cls}" ${x.ok?`onclick="pickDest('${x.host}')"`:''}>
      <span>${x.host}</span><b>${info}</b></div>`}).join('')+`</div>
    <div style="color:#6b7280;font-size:12px;margin-top:6px">点击绿色条目即可选用（需 TLS1.3 + H2 才合格）</div>`}
@@ -1996,6 +2047,7 @@ async function speedOut(t0){const t=decodeURIComponent(t0);
      const col=s.latency<=100?'#3ddc84':(s.latency<=250?'#f0c674':'#ff8080');
      b.innerHTML=`<b style="color:${col}">${s.latency}ms</b>`
        +(s.best!==s.latency?` <i style="color:#6b7280;font-style:normal;font-size:12px">最快 ${s.best}ms</i>`:'')
+       +(s.total?` <i style="color:#6b7280;font-style:normal;font-size:12px">· 完整往返 ${s.total}ms</i>`:'')
        +(s.loss?` <span style="color:#ff8080;font-size:12px">丢包 ${s.loss}%</span>`:'')
        +(s.ip?` <i style="color:#6b7280;font-style:normal;font-size:12px">${esc(s.ip)}</i>`:'');
      return}
@@ -2065,8 +2117,15 @@ document.getElementById('modal').addEventListener('click',e=>{
 </script></body></html>"""
 
 
+class PanelHTTPServer(ThreadingHTTPServer):
+    daemon_threads = True
+    request_queue_size = 128      # 默认只有 5，堆积时会直接拒绝连接
+    allow_reuse_address = True
+
+
 class Handler(BaseHTTPRequestHandler):
     server_version = "sb-panel"
+    timeout = 30                  # 单个请求最长 30 秒，避免僵死占用线程
 
     def log_message(self, *a):
         pass
@@ -2143,9 +2202,9 @@ class Handler(BaseHTTPRequestHandler):
         if p.startswith("/api/speed-status/"):
             t = urllib.parse.unquote(p[len("/api/speed-status/"):])
             return self._send(200, dict(SPEED_JOB.get(t, {})))
+        if p == "/api/status":
+            return self._send(200, api_status())
         with LOCK:
-            if p == "/api/status":
-                return self._send(200, api_status())
             if p == "/api/protocols":
                 return self._send(200, PROTOCOLS)
             if p == "/api/inbounds":
@@ -2489,7 +2548,7 @@ def main():
     sub_port = int(pc.get("sub_port", 8080))
     if sub_port and sub_port != port:
         try:
-            subd = ThreadingHTTPServer(("0.0.0.0", sub_port), SubHandler)
+            subd = PanelHTTPServer(("0.0.0.0", sub_port), SubHandler)
             sscheme = "http"
             sdom = pc.get("tls_domain", "")
             if sdom:
@@ -2505,7 +2564,7 @@ def main():
         except OSError as e:
             print(f"订阅端口 {sub_port} 启动失败: {e}", file=sys.stderr)
 
-    httpd = ThreadingHTTPServer((host, port), Handler)
+    httpd = PanelHTTPServer((host, port), Handler)
     scheme = "http"
     dom = pc.get("tls_domain", "")
     if dom:

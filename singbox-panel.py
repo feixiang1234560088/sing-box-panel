@@ -451,6 +451,13 @@ def janitor_loop():
     while True:
         try:
             cleanup_disk(deep=False)
+            # 内存侧清理：过期会话、超量任务记录
+            now = time.time()
+            for k in [k for k, v in SESSIONS.items() if v <= now]:
+                SESSIONS.pop(k, None)
+            if len(globals().get("SPEED_JOB", {})) > 50:
+                globals()["SPEED_JOB"].clear()
+            del AUTO_LOG[:-10]
         except Exception:
             pass
         time.sleep(12 * 3600)
@@ -2173,7 +2180,18 @@ class PanelHTTPServer(ThreadingHTTPServer):
     allow_reuse_address = True
 
 
-class Handler(BaseHTTPRequestHandler):
+class QuietMixin:
+    def handle_one_request(self):
+        try:
+            super().handle_one_request()
+        except (ConnectionResetError, BrokenPipeError, TimeoutError, OSError):
+            self.close_connection = True      # 客户端中断/扫描器探测，静默忽略
+
+    def handle_error(self, *a):
+        pass
+
+
+class Handler(QuietMixin, BaseHTTPRequestHandler):
     server_version = "sb-panel"
     timeout = 30                  # 单个请求最长 30 秒，避免僵死占用线程
 
@@ -2193,8 +2211,10 @@ class Handler(BaseHTTPRequestHandler):
     def _auth(self):
         tk = self.headers.get("X-Token", "")
         exp = SESSIONS.get(tk)
-        if exp and exp > time.time():
+        now = time.time()
+        if exp and exp > now:
             return True
+        SESSIONS.pop(tk, None)
         return False
 
     def _body(self):
@@ -2380,8 +2400,15 @@ class Handler(BaseHTTPRequestHandler):
             pc = load_json(PANEL_CFG, {})
             h = hashlib.sha256((b.get("password", "") + pc.get("salt", "")).encode()).hexdigest()
             if h == pc.get("pwhash"):
+                now = time.time()
+                # 清理过期会话，防止长期运行内存增长
+                for k in [k for k, v in SESSIONS.items() if v <= now]:
+                    SESSIONS.pop(k, None)
+                if len(SESSIONS) > 50:            # 上限，最旧的先出
+                    for k in sorted(SESSIONS, key=SESSIONS.get)[:len(SESSIONS) - 50]:
+                        SESSIONS.pop(k, None)
                 tk = secrets.token_hex(24)
-                SESSIONS[tk] = time.time() + SESSION_TTL
+                SESSIONS[tk] = now + SESSION_TTL
                 return self._send(200, {"ok": True, "token": tk})
             time.sleep(1)
             return self._send(200, {"ok": False})
@@ -2533,7 +2560,7 @@ class Handler(BaseHTTPRequestHandler):
         return self._send(404, {"ok": False})
 
 
-class SubHandler(BaseHTTPRequestHandler):
+class SubHandler(QuietMixin, BaseHTTPRequestHandler):
     """订阅服务：以 text/plain 返回，浏览器内联显示而非下载"""
     server_version = "sb-sub"
 

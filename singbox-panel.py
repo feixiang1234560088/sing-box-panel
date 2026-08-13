@@ -88,13 +88,25 @@ def public_ip(force=False):
 
 
 def rand_port():
+    """随机可用端口。纯 Python 探测，不起子进程，最多尝试 30 次。"""
+    import socket as _sk
     used = {i.get("listen_port") for i in cfg().get("inbounds", [])}
-    while True:
+    for _ in range(30):
         p = secrets.randbelow(40000) + 20000
-        if p not in used:
-            c, o, _ = sh(f"ss -lntu 2>/dev/null | grep -cE '[:.]{p}[[:space:]]'")
-            if o.strip() in ("0", ""):
-                return p
+        if p in used:
+            continue
+        free = True
+        for fam, typ in ((_sk.AF_INET, _sk.SOCK_STREAM), (_sk.AF_INET, _sk.SOCK_DGRAM)):
+            try:
+                with _sk.socket(fam, typ) as t:
+                    t.setsockopt(_sk.SOL_SOCKET, _sk.SO_REUSEADDR, 1)
+                    t.bind(("", p))
+            except OSError:
+                free = False
+                break
+        if free:
+            return p
+    return secrets.randbelow(40000) + 20000
 
 
 def gen_uuid():
@@ -114,7 +126,13 @@ def gen_reality():
     return priv, pub
 
 
+_CERT_CACHE = {"t": 0, "v": []}
+
+
 def list_certs():
+    now = time.time()
+    if _CERT_CACHE["v"] and now - _CERT_CACHE["t"] < 300:
+        return _CERT_CACHE["v"]
     out = []
     if os.path.isdir(CERT_DIR):
         for d in sorted(os.listdir(CERT_DIR)):
@@ -124,6 +142,7 @@ def list_certs():
                 c, o, _ = sh(f"openssl x509 -in {fc} -noout -enddate")
                 out.append({"domain": d, "cert": fc, "key": pk,
                             "expire": o.replace("notAfter=", "").strip()})
+    _CERT_CACHE.update(t=now, v=out)
     return out
 
 
@@ -273,6 +292,7 @@ def issue_cert(domain):
        f'systemd-run --collect --on-active=2 --unit=sbpanel-reload systemctl restart singbox-panel"', 60)
     sh("systemctl start sing-box")
 
+    _CERT_CACHE.update(t=0, v=[])
     if not os.path.exists(f"{CERT_DIR}/{domain}/fullchain.pem"):
         return False, "证书已签发但安装失败，请查看 /root/.acme.sh 日志"
     # 面板正用此域名时，安全地重启自己以加载新证书
@@ -434,6 +454,36 @@ def janitor_loop():
         except Exception:
             pass
         time.sleep(12 * 3600)
+
+
+HEARTBEAT = {"t": time.time()}
+
+
+def watchdog_loop(host, port):
+    """看门狗：定期自检面板是否还能响应，卡死则退出让 systemd 拉起。"""
+    import socket as _sk
+    time.sleep(90)
+    fails = 0
+    probe_host = "127.0.0.1" if host in ("0.0.0.0", "::", "") else host
+    while True:
+        time.sleep(60)
+        ok = False
+        try:
+            with _sk.create_connection((probe_host, port), timeout=8) as c:
+                c.sendall(b"GET /__ping HTTP/1.0\r\n\r\n")
+                ok = bool(c.recv(16))
+        except Exception:
+            ok = False
+        # 主线程心跳超过 5 分钟没更新也算异常
+        stale = (time.time() - HEARTBEAT["t"]) > 300
+        if ok and not stale:
+            fails = 0
+            continue
+        fails += 1
+        print(f"[watchdog] 自检失败 {fails}/3 (响应={ok} 心跳陈旧={stale})", file=sys.stderr)
+        if fails >= 3:
+            print("[watchdog] 面板无响应，退出由 systemd 重启", file=sys.stderr)
+            os._exit(1)          # systemd Restart=always 会立刻拉起
 
 
 def safe_restart_self(delay=1):
@@ -2131,6 +2181,7 @@ class Handler(BaseHTTPRequestHandler):
         pass
 
     def _send(self, code, data, ctype="application/json"):
+        HEARTBEAT["t"] = time.time()
         body = data if isinstance(data, bytes) else json.dumps(data, ensure_ascii=False).encode()
         self.send_response(code)
         self.send_header("Content-Type", ctype + ("; charset=utf-8" if "json" in ctype or "html" in ctype else ""))
@@ -2178,6 +2229,8 @@ class Handler(BaseHTTPRequestHandler):
 
     def _do_GET(self):
         raw = urllib.parse.urlparse(self.path).path
+        if raw == "/__ping":
+            return self._send(200, b"pong", "text/plain")
         p = self._strip_base(raw)
         if p is None:
             return self._send(404, b"404 Not Found", "text/plain")
@@ -2204,7 +2257,8 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(200, dict(SPEED_JOB.get(t, {})))
         if p == "/api/status":
             return self._send(200, api_status())
-        with LOCK:
+        # 只读接口不加锁：避免慢命令把整个面板卡死
+        if True:
             if p == "/api/protocols":
                 return self._send(200, PROTOCOLS)
             if p == "/api/inbounds":
@@ -2543,6 +2597,7 @@ def main():
     rebuild_sub()
     threading.Thread(target=janitor_loop, daemon=True).start()
     threading.Thread(target=auto_update_loop, daemon=True).start()
+    threading.Thread(target=watchdog_loop, args=(host, port), daemon=True).start()
 
     # 订阅服务与面板同进程（省一个 Python 解释器约 20MB）
     sub_port = int(pc.get("sub_port", 8080))

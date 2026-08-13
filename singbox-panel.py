@@ -466,31 +466,52 @@ def janitor_loop():
 HEARTBEAT = {"t": time.time()}
 
 
-def watchdog_loop(host, port):
-    """看门狗：定期自检面板是否还能响应，卡死则退出让 systemd 拉起。"""
+def watchdog_loop(host, port, use_tls=False):
+    """看门狗：面板卡死时自杀让 systemd 拉起。
+    判定必须同时满足「探测无响应」和「心跳陈旧」，避免误杀。"""
     import socket as _sk
-    time.sleep(90)
-    fails = 0
+    time.sleep(120)
     probe_host = "127.0.0.1" if host in ("0.0.0.0", "::", "") else host
+    fails = 0
     while True:
         time.sleep(60)
+        # 心跳：只要近 5 分钟内有请求被处理过，就说明面板是活的
+        fresh = (time.time() - HEARTBEAT["t"]) <= 300
+        if fresh:
+            fails = 0
+            continue
+
+        # 心跳陈旧才主动探测（TLS 面板要用 TLS 握手，否则必然失败）
         ok = False
         try:
-            with _sk.create_connection((probe_host, port), timeout=8) as c:
-                c.sendall(b"GET /__ping HTTP/1.0\r\n\r\n")
-                ok = bool(c.recv(16))
+            raw = _sk.create_connection((probe_host, port), timeout=8)
+            try:
+                if use_tls:
+                    import ssl as _s
+                    c = _s.SSLContext(_s.PROTOCOL_TLS_CLIENT)
+                    c.check_hostname = False
+                    c.verify_mode = _s.CERT_NONE
+                    conn = c.wrap_socket(raw, server_hostname=probe_host)
+                else:
+                    conn = raw
+                conn.sendall(b"GET /__ping HTTP/1.0\r\n\r\n")
+                ok = b"200" in conn.recv(64)
+            finally:
+                try:
+                    conn.close()
+                except Exception:
+                    raw.close()
         except Exception:
             ok = False
-        # 主线程心跳超过 5 分钟没更新也算异常
-        stale = (time.time() - HEARTBEAT["t"]) > 300
-        if ok and not stale:
+
+        if ok:
             fails = 0
             continue
         fails += 1
-        print(f"[watchdog] 自检失败 {fails}/3 (响应={ok} 心跳陈旧={stale})", file=sys.stderr)
+        print(f"[watchdog] 无响应且心跳陈旧 {fails}/3", file=sys.stderr)
         if fails >= 3:
-            print("[watchdog] 面板无响应，退出由 systemd 重启", file=sys.stderr)
-            os._exit(1)          # systemd Restart=always 会立刻拉起
+            print("[watchdog] 面板卡死，退出由 systemd 重启", file=sys.stderr)
+            os._exit(1)
 
 
 def safe_restart_self(delay=1):
@@ -2624,7 +2645,9 @@ def main():
     rebuild_sub()
     threading.Thread(target=janitor_loop, daemon=True).start()
     threading.Thread(target=auto_update_loop, daemon=True).start()
-    threading.Thread(target=watchdog_loop, args=(host, port), daemon=True).start()
+    _wd_tls = bool(pc.get("tls_domain")) and os.path.exists(
+        f"{CERT_DIR}/{pc.get('tls_domain', '')}/fullchain.pem")
+    threading.Thread(target=watchdog_loop, args=(host, port, _wd_tls), daemon=True).start()
 
     # 订阅服务与面板同进程（省一个 Python 解释器约 20MB）
     sub_port = int(pc.get("sub_port", 8080))

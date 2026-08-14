@@ -527,8 +527,42 @@ def safe_restart_self(delay=1):
            f">/dev/null 2>&1 &", 5)
 
 
+def prune_orphan_rules(c):
+    """清理孤儿路由规则：指向不存在出站的绑定、无对应入站的 QUIC 拒绝、重复规则"""
+    obs = {o.get("tag") for o in c.get("outbounds", [])}
+    ins = {i.get("tag") for i in c.get("inbounds", [])}
+    rules = c.get("route", {}).get("rules", [])
+    out, seen, removed = [], set(), 0
+    for r in rules:
+        # 指向已删除出站的规则
+        if r.get("outbound") and r["outbound"] not in obs:
+            removed += 1; continue
+        # inbound 里已不存在的入站，摘掉
+        if r.get("inbound"):
+            rest = [x for x in r["inbound"] if x in ins]
+            if not rest:
+                removed += 1; continue
+            if rest != r["inbound"]:
+                r = dict(r, inbound=rest)
+        # 完全重复的规则去重
+        key = json.dumps(r, sort_keys=True, ensure_ascii=False)
+        if key in seen:
+            removed += 1; continue
+        seen.add(key)
+        out.append(r)
+    if removed:
+        c["route"]["rules"] = out
+    return removed
+
+
 def apply_config(new_cfg):
     """校验并写入，失败自动回滚"""
+    try:
+        n = prune_orphan_rules(new_cfg)
+        if n:
+            print(f"[config] 清理 {n} 条孤儿/重复路由规则", file=sys.stderr)
+    except Exception:
+        pass
     old = None
     if os.path.exists(SB_CONF):
         with open(SB_CONF) as f:
@@ -1512,8 +1546,21 @@ def api_add_outbound(body):
         valid = {i.get("tag") for i in c.get("inbounds", [])}
         binds = [b for b in binds if b in valid]
         rules = c.get("route", {}).get("rules", [{"action": "sniff"}])
-        rules = [r for r in rules
-                 if not (set(r.get("inbound") or []) & set(binds))]
+        # 移除这些入站的旧绑定；旧 QUIC 规则里也把它们摘掉，防止重复累积
+        cleaned = []
+        for r in rules:
+            inb = set(r.get("inbound") or [])
+            if not inb:
+                cleaned.append(r); continue
+            if r.get("protocol") == "quic" and r.get("action") == "reject":
+                rest = [x for x in (r.get("inbound") or []) if x not in set(binds)]
+                if rest:
+                    cleaned.append(dict(r, inbound=rest))
+                continue
+            if inb & set(binds):
+                continue
+            cleaned.append(r)
+        rules = cleaned
         head = rules[:1] if rules and rules[0].get("action") == "sniff" else []
         tail = rules[1:] if head else rules
         new_rules = []
@@ -1556,7 +1603,22 @@ def api_del_outbound(tag):
     c = cfg()
     c["outbounds"] = [o for o in c.get("outbounds", []) if o.get("tag") != tag]
     rules = c.get("route", {}).get("rules", [])
-    c["route"]["rules"] = [r for r in rules if r.get("outbound") != tag]
+    # 先记下绑到此出站的入站，它们的 QUIC 拒绝规则也要一并清掉
+    freed = set()
+    for r in rules:
+        if r.get("outbound") == tag:
+            freed |= set(r.get("inbound") or [])
+    kept = []
+    for r in rules:
+        if r.get("outbound") == tag:
+            continue                                   # 绑定规则
+        if r.get("protocol") == "quic" and r.get("action") == "reject":
+            rest = [x for x in (r.get("inbound") or []) if x not in freed]
+            if not rest:
+                continue                               # 该 QUIC 规则已无对应入站，丢弃
+            r = dict(r, inbound=rest)                  # 只保留仍绑着别的出站的入站
+        kept.append(r)
+    c["route"]["rules"] = kept
     if c.get("route", {}).get("final") == tag:
         c["route"]["final"] = "direct"
     okk, msg = apply_config(c)
@@ -1566,7 +1628,18 @@ def api_del_outbound(tag):
 def api_bind(inbound, outbound):
     c = cfg()
     rules = c.get("route", {}).get("rules", [{"action": "sniff"}])
-    rules = [r for r in rules if inbound not in (r.get("inbound") or [])]
+    cleaned = []
+    for r in rules:
+        inb = r.get("inbound") or []
+        if inbound not in inb:
+            cleaned.append(r); continue
+        # 该入站的 QUIC 拒绝规则：摘掉它，其他入站保留
+        if r.get("protocol") == "quic" and r.get("action") == "reject":
+            rest = [x for x in inb if x != inbound]
+            if rest:
+                cleaned.append(dict(r, inbound=rest))
+        # 绑定规则直接丢弃（下面会重建）
+    rules = cleaned
     if outbound and outbound != "direct":
         head = rules[:1] if rules and rules[0].get("action") == "sniff" else []
         tail = rules[1:] if head else rules

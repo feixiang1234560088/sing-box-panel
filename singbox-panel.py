@@ -5,6 +5,7 @@ sing-box 轻量 Web 面板  (纯标准库，无第三方依赖)
 功能: 建节点(7种协议) / 出站管理 / 节点绑定出站 / 分享链接 / 订阅
 """
 import base64
+import gzip
 import hashlib
 import json
 import os
@@ -775,6 +776,189 @@ PROTOCOLS = {
 }
 
 
+# ════════════════════════════════════════════
+# 高级选项 —— 加速 / 抗封锁 / 传输层（对齐 s-ui）
+# ════════════════════════════════════════════
+ADV_TCP = [
+    {"k": "tfo", "l": "TCP Fast Open", "t": "bool", "d": "0",
+     "h": "首包随握手一起发，省一个 RTT。少数运营商中间设备会丢弃，连不上就关掉"},
+    {"k": "mptcp", "l": "TCP Multi Path", "t": "bool", "d": "0",
+     "h": "多路径 TCP（手机 WiFi+蜂窝同时用），客户端也要开才生效"},
+]
+ADV_UDP = [
+    {"k": "udpfrag", "l": "允许 UDP 分片", "t": "bool", "d": "0",
+     "h": "转发被分片的 UDP 包，部分游戏 / BT 需要"},
+    {"k": "udpto", "l": "UDP 会话超时", "t": "text", "d": "5m",
+     "h": "如 5m / 30s。调短省内存，太短会导致游戏语音断流"},
+]
+ADV_MUX = [
+    {"k": "mux", "l": "允许多路复用", "t": "bool", "d": "0",
+     "h": "多个请求共用一条连接，网页秒开；大文件下载可能变慢。与 vision 流控互斥"},
+    {"k": "mux_pad", "l": "复用流量填充", "t": "bool", "d": "0",
+     "h": "给复用流加随机填充，削弱流量指纹（略增开销）"},
+    {"k": "mux_brutal", "l": "Brutal 拥塞控制", "t": "bool", "d": "0",
+     "h": "无视丢包按固定带宽发包，丢包线路提速明显；需下面两项都填"},
+    {"k": "mux_up", "l": "Brutal 上行 Mbps", "t": "number", "d": "0"},
+    {"k": "mux_down", "l": "Brutal 下行 Mbps", "t": "number", "d": "0"},
+]
+ADV_TLS = [
+    {"k": "tls_min", "l": "TLS 最低版本", "t": "select", "opts": ["1.3", "1.2"], "d": "1.3",
+     "h": "1.3 更快更隐蔽；只有老客户端连不上时才降到 1.2"},
+    {"k": "alpn", "l": "ALPN", "t": "select",
+     "opts": ["不设置", "h2,http/1.1", "h2", "http/1.1"], "d": "不设置",
+     "h": "h2 多路复用更快；改动后客户端需重新拉订阅，不确定就保持不设置"},
+]
+TRANSPORTS = [
+    {"k": "transport", "l": "传输层", "t": "select",
+     "opts": ["TCP (原始，最快)", "WebSocket", "gRPC", "HTTPUpgrade"], "d": "TCP (原始，最快)",
+     "h": "原始 TCP 延迟最低；WS / HTTPUpgrade 可过 CDN；gRPC 抗干扰强"},
+    {"k": "tr_path", "l": "路径 / 服务名", "t": "text", "d": "/",
+     "h": "WS 与 HTTPUpgrade 填路径（如 /ws）；gRPC 填 serviceName"},
+    {"k": "tr_host", "l": "Host 伪装", "t": "text", "d": "",
+     "h": "留空则用证书域名。套 CDN 时填回源域名"},
+    {"k": "tr_ed", "l": "WebSocket 0-RTT", "t": "bool", "d": "0",
+     "h": "首包塞进握手，省一个 RTT（仅 WebSocket 生效）"},
+]
+
+_ADV_MAP = {
+    "hysteria2":   ADV_UDP,
+    "hysteria":    ADV_UDP,
+    "tuic":        ADV_UDP,
+    "vless":       ADV_TCP + ADV_UDP + ADV_MUX,
+    "vless-tls":   ADV_TCP + ADV_UDP + ADV_MUX + ADV_TLS + TRANSPORTS,
+    "vmess":       ADV_TCP + ADV_UDP + ADV_MUX + ADV_TLS + TRANSPORTS,
+    "trojan":      ADV_TCP + ADV_UDP + ADV_MUX + ADV_TLS + TRANSPORTS,
+    "anytls":      ADV_TCP + ADV_UDP + ADV_TLS,
+    "naive":       ADV_TCP + ADV_UDP + ADV_TLS,
+    "shadowtls":   ADV_TCP,
+    "snell":       ADV_TCP + ADV_UDP,
+    "mixed":       ADV_TCP + ADV_UDP,
+    "http":        ADV_TCP + ADV_UDP,
+    "socks":       ADV_TCP + ADV_UDP,
+    "shadowsocks": ADV_TCP + ADV_UDP + ADV_MUX,
+}
+for _p, _a in _ADV_MAP.items():
+    PROTOCOLS[_p]["adv"] = _a
+
+
+def _bl(f, k):
+    return str(f.get(k, "0")).lower() in ("1", "true", "on", "yes")
+
+
+def _uq(uri, **kw):
+    """给 url 风格的分享链接补/改查询参数（保留 #备注）"""
+    base, _, frag = uri.partition("#")
+    for k, v in kw.items():
+        if v is None:
+            base = re.sub(rf"[&?]{k}=[^&]*", "", base)
+            continue
+        v = uenc(v)
+        if re.search(rf"[&?]{k}=", base):
+            base = re.sub(rf"([&?]{k}=)[^&]*", lambda m: m.group(1) + v, base)
+        else:
+            base += ("&" if "?" in base else "?") + f"{k}={v}"
+    return base + ("#" + frag if frag else "")
+
+
+def apply_advanced(ib, uri, proto, f):
+    """把高级选项写进 inbound，并同步修正分享链接。返回 (ib, uri)"""
+    keys = {a["k"] for a in (PROTOCOLS.get(proto, {}).get("adv") or [])}
+    if not keys:
+        return ib, uri
+
+    # —— 监听层：TCP / UDP ——
+    if "tfo" in keys and _bl(f, "tfo"):
+        ib["tcp_fast_open"] = True
+    if "mptcp" in keys and _bl(f, "mptcp"):
+        ib["tcp_multi_path"] = True
+    if "udpfrag" in keys and _bl(f, "udpfrag"):
+        ib["udp_fragment"] = True
+    if "udpto" in keys:
+        t = (f.get("udpto") or "").strip()
+        if t and t != "5m" and re.match(r"^\d+[smh]$", t):
+            ib["udp_timeout"] = t
+
+    # —— 多路复用（与 xtls-rprx-vision 互斥，vision 优先）——
+    _vision = any(u.get("flow") for u in ib.get("users", []))
+    if "mux" in keys and _bl(f, "mux") and not _vision:
+        mx = {"enabled": True}
+        if _bl(f, "mux_pad"):
+            mx["padding"] = True
+        if _bl(f, "mux_brutal"):
+            try:
+                up, dn = int(f.get("mux_up") or 0), int(f.get("mux_down") or 0)
+            except (TypeError, ValueError):
+                up = dn = 0
+            if up > 0 and dn > 0:
+                mx["brutal"] = {"enabled": True, "up_mbps": up, "down_mbps": dn}
+        ib["multiplex"] = mx
+
+    tls = ib.get("tls")
+    # —— TLS ——
+    if tls:
+        if "tls_min" in keys:
+            tls["min_version"] = "1.2" if f.get("tls_min") == "1.2" else "1.3"
+        if "alpn" in keys:
+            a = f.get("alpn", "h2,http/1.1")
+            if a == "不设置":
+                tls.pop("alpn", None)
+            else:
+                tls["alpn"] = [x.strip() for x in a.split(",") if x.strip()]
+                if uri.startswith(("vless://", "trojan://")):
+                    uri = _uq(uri, alpn=a)
+
+    # —— 传输层 ——
+    if "transport" in keys:
+        sel = f.get("transport", "")
+        raw = (f.get("tr_path") or "/").strip()
+        host = (f.get("tr_host") or "").strip()
+        kind = path = ""
+        if sel.startswith("WebSocket"):
+            kind, path = "ws", (raw if raw.startswith("/") else "/" + raw)
+            tr = {"type": "ws", "path": path}
+            if host:
+                tr["headers"] = {"Host": host}
+            if _bl(f, "tr_ed"):
+                tr["early_data_header_name"] = "Sec-WebSocket-Protocol"
+                tr["max_early_data"] = 2048
+            ib["transport"] = tr
+        elif sel.startswith("gRPC"):
+            kind = "grpc"
+            path = raw.lstrip("/") or "grpc"
+            ib["transport"] = {"type": "grpc", "service_name": path}
+        elif sel.startswith("HTTPUpgrade"):
+            kind, path = "httpupgrade", (raw if raw.startswith("/") else "/" + raw)
+            tr = {"type": "httpupgrade", "path": path}
+            if host:
+                tr["host"] = host
+            ib["transport"] = tr
+
+        if kind:
+            # vision 流控与非 TCP 传输互斥
+            for u in ib.get("users", []):
+                u.pop("flow", None)
+            if uri.startswith("vmess://"):
+                try:
+                    vm = json.loads(base64.b64decode(uri[8:] + "==").decode())
+                    vm["net"] = kind
+                    if kind == "grpc":
+                        vm["path"] = path
+                    else:
+                        vm["path"] = path
+                    if host:
+                        vm["host"] = host
+                    uri = "vmess://" + b64(json.dumps(vm, ensure_ascii=False))
+                except Exception:
+                    pass
+            else:
+                kw = {"type": kind, "flow": None}
+                kw["serviceName" if kind == "grpc" else "path"] = path
+                if host:
+                    kw["host"] = host
+                uri = _uq(uri, **kw)
+    return ib, uri
+
+
 def build_inbound(proto, f, tag):
     """返回 (inbound, share_uri)"""
     port = int(f["port"])
@@ -976,6 +1160,10 @@ def build_inbound(proto, f, tag):
     else:
         raise ValueError("不支持的协议")
 
+    extra = ib.pop("_extra_inbound", None)
+    ib, uri = apply_advanced(ib, uri, proto, f)
+    if extra:
+        ib["_extra_inbound"] = extra
     return ib, uri
 
 
@@ -1400,6 +1588,35 @@ def inbound_to_fields(ib, proto, info):
     elif proto == "shadowsocks":
         f["method"] = ib.get("method", "2022-blake3-aes-128-gcm")
         f["password"] = ib.get("password", "")
+
+    # ── 高级选项反推 ──
+    keys = {a["k"] for a in (PROTOCOLS.get(proto, {}).get("adv") or [])}
+    if "tfo" in keys:
+        f["tfo"] = "1" if ib.get("tcp_fast_open") else "0"
+        f["mptcp"] = "1" if ib.get("tcp_multi_path") else "0"
+    if "udpfrag" in keys:
+        f["udpfrag"] = "1" if ib.get("udp_fragment") else "0"
+        f["udpto"] = ib.get("udp_timeout") or "5m"
+    if "mux" in keys:
+        mx = ib.get("multiplex") or {}
+        f["mux"] = "1" if mx.get("enabled") else "0"
+        f["mux_pad"] = "1" if mx.get("padding") else "0"
+        br = mx.get("brutal") or {}
+        f["mux_brutal"] = "1" if br.get("enabled") else "0"
+        f["mux_up"] = str(br.get("up_mbps", 0) or 0)
+        f["mux_down"] = str(br.get("down_mbps", 0) or 0)
+    if "tls_min" in keys:
+        f["tls_min"] = tls.get("min_version") or "1.3"
+        al = tls.get("alpn")
+        f["alpn"] = ",".join(al) if al else "不设置"
+    if "transport" in keys:
+        tr = ib.get("transport") or {}
+        tt = tr.get("type", "")
+        f["transport"] = {"ws": "WebSocket", "grpc": "gRPC",
+                          "httpupgrade": "HTTPUpgrade"}.get(tt, "TCP (原始，最快)")
+        f["tr_path"] = tr.get("service_name") or tr.get("path") or "/"
+        f["tr_host"] = tr.get("host") or (tr.get("headers") or {}).get("Host", "") or ""
+        f["tr_ed"] = "1" if tr.get("max_early_data") else "0"
     return f
 
 
@@ -1736,72 +1953,143 @@ def api_test_outbound(tag):
 HTML = r"""<!doctype html><html lang="zh"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>sing-box 面板</title><style>
+:root{
+ --bg:#0d0f13; --bg2:#141721; --card:#171a23; --card2:#1c2029;
+ --line:#242938; --line2:#2e3546;
+ --tx:#e8eaf0; --tx2:#8b93a7; --tx3:#5c6478;
+ --pri:#3b82f6; --pri2:#2563eb; --ok:#34d399; --warn:#fbbf24; --err:#f87171;
+ --r:12px; --r2:9px; --sh:0 1px 3px rgba(0,0,0,.4),0 8px 24px -8px rgba(0,0,0,.5);
+}
 *{box-sizing:border-box;margin:0;padding:0}
-body{background:#14161a;color:#e6e8eb;font:14px/1.6 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}
-a{color:#4aa8ff;text-decoration:none}
-.wrap{max-width:1100px;margin:0 auto;padding:20px}
-header{display:flex;align-items:center;justify-content:space-between;padding:16px 0;border-bottom:1px solid #262a31;margin-bottom:20px;flex-wrap:wrap;gap:12px}
-h1{font-size:18px;font-weight:600}
-.stat{display:flex;gap:18px;font-size:13px;color:#8b93a1;flex-wrap:wrap}
-.stat b{color:#e6e8eb;font-weight:600}
-.dot{display:inline-block;width:8px;height:8px;border-radius:50%;margin-right:5px}
-.on{background:#3ddc84}.off{background:#ff5c5c}
-.tabs{display:flex;gap:4px;margin-bottom:18px;flex-wrap:wrap}
-.tab{padding:8px 16px;border-radius:8px;cursor:pointer;color:#8b93a1;font-size:14px}
-.tab.active{background:#1e222a;color:#fff}
-.card{background:#1a1d23;border:1px solid #262a31;border-radius:12px;padding:16px;margin-bottom:12px}
-.card h3{font-size:15px;margin-bottom:4px;display:flex;align-items:center;gap:8px}
-.badge{font-size:11px;padding:2px 8px;border-radius:20px;background:#262a31;color:#8b93a1;font-weight:500}
-.row{display:flex;justify-content:space-between;padding:6px 0;font-size:13px;border-bottom:1px solid #22262d}
+body{background:var(--bg);color:var(--tx);
+ font:14px/1.6 -apple-system,BlinkMacSystemFont,"PingFang SC","Segoe UI",sans-serif;
+ -webkit-font-smoothing:antialiased}
+a{color:var(--pri);text-decoration:none}
+a:hover{opacity:.8}
+.wrap{max-width:1180px;margin:0 auto;padding:0 20px 48px}
+header{position:sticky;top:0;z-index:20;background:rgba(13,15,19,.85);
+ backdrop-filter:blur(12px);border-bottom:1px solid var(--line);
+ display:flex;align-items:center;gap:20px;padding:14px 0;margin-bottom:22px;flex-wrap:wrap}
+h1{font-size:16px;font-weight:650;letter-spacing:.2px;white-space:nowrap}
+.stat{display:flex;gap:16px;font-size:12.5px;color:var(--tx2);flex-wrap:wrap;flex:1}
+.stat b{color:var(--tx);font-weight:600}
+.dot{display:inline-block;width:7px;height:7px;border-radius:50%;margin-right:6px;vertical-align:1px}
+.on{background:var(--ok);box-shadow:0 0 0 3px rgba(52,211,153,.15)}
+.off{background:var(--err);box-shadow:0 0 0 3px rgba(248,113,113,.15)}
+.tabs{display:flex;gap:2px;margin-bottom:20px;flex-wrap:wrap;
+ background:var(--bg2);padding:4px;border-radius:var(--r);width:fit-content}
+.tab{padding:7px 16px;border-radius:var(--r2);cursor:pointer;color:var(--tx2);
+ font-size:13.5px;font-weight:500;transition:.15s;user-select:none}
+.tab:hover{color:var(--tx)}
+.tab.active{background:var(--card2);color:#fff;box-shadow:0 1px 2px rgba(0,0,0,.3)}
+.card{background:var(--card);border:1px solid var(--line);border-radius:var(--r);
+ padding:16px 18px;margin-bottom:12px;transition:.15s}
+.card:hover{border-color:var(--line2)}
+.card h3{font-size:14.5px;font-weight:600;margin-bottom:10px;
+ display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+.badge{font-size:10.5px;padding:2px 8px;border-radius:20px;background:var(--bg2);
+ color:var(--tx2);font-weight:500;border:1px solid var(--line)}
+.row{display:flex;justify-content:space-between;align-items:center;gap:12px;
+ padding:7px 0;font-size:13px;border-bottom:1px solid var(--line)}
 .row:last-of-type{border:0}
-.row span:first-child{color:#8b93a1}
-.uri{background:#0f1114;border:1px solid #262a31;border-radius:8px;padding:10px;font:12px/1.5 ui-monospace,Menlo,monospace;word-break:break-all;color:#9fd4ff;margin-top:10px;cursor:pointer}
-.uri:hover{border-color:#4aa8ff}
-button{background:#2563eb;color:#fff;border:0;border-radius:8px;padding:9px 16px;font-size:14px;cursor:pointer;font-family:inherit}
-button:hover{background:#1d4ed8}button:disabled{opacity:.5;cursor:not-allowed}
-.btn2{background:#262a31}.btn2:hover{background:#323844}
-.btnd{background:#3a1f22;color:#ff8080}.btnd:hover{background:#4a2529}
-.acts{display:flex;gap:8px;margin-top:12px;flex-wrap:wrap}
-label{display:block;font-size:13px;color:#8b93a1;margin:12px 0 5px}
-input,select{width:100%;background:#0f1114;border:1px solid #2c313a;border-radius:8px;padding:9px 11px;color:#e6e8eb;font-size:14px;font-family:inherit}
-input:focus,select:focus{outline:0;border-color:#2563eb}
-.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(320px,1fr));gap:12px}
-.modal{position:fixed;inset:0;background:rgba(0,0,0,.7);display:none;align-items:center;justify-content:center;padding:20px;z-index:99}
-.modal.show{display:flex}
-.mbox{background:#1a1d23;border:1px solid #2c313a;border-radius:14px;padding:22px;max-width:520px;width:100%;max-height:88vh;overflow:auto}
-.mbox h2{font-size:16px;margin-bottom:6px}
-.toast{position:fixed;bottom:24px;left:50%;transform:translateX(-50%);background:#1e222a;border:1px solid #2c313a;padding:12px 20px;border-radius:10px;display:none;z-index:100;max-width:90%}
-.toast.show{display:block}
-.toast.err{border-color:#7f2d2d;color:#ff9b9b}
-.toast.ok{border-color:#2d7f4f;color:#8ff0b5}
-.spin{display:inline-block;width:12px;height:12px;border:2px solid #3a4150;border-top-color:#4aa8ff;border-radius:50%;animation:sp .7s linear infinite;vertical-align:-1px;margin-right:6px}
-@keyframes sp{to{transform:rotate(360deg)}}
-.vtag{font-size:10px;padding:1px 6px;border-radius:10px;margin-left:6px}
-.vtag.pre{background:#3a2a1a;color:#f0c674}
-.vtag.rel{background:#1e3a2a;color:#8ff0b5}
-.vcur{background:#16241c}
-.alert{background:#3a2a1a;border:1px solid #7a5a2a;color:#f0c674;border-radius:8px;padding:11px 13px;font-size:13px;margin-bottom:10px;line-height:1.7}
-.cmd{background:#0f1114;border:1px solid #2c313a;border-radius:6px;padding:8px 10px;margin-top:8px;font:11px/1.5 ui-monospace,Menlo,monospace;color:#9fd4ff;word-break:break-all;user-select:all}
-.scanning{color:#8b93a1;font-size:13px;padding:10px}
-.scanlist{margin-top:8px;border:1px solid #2c313a;border-radius:8px;overflow:auto;max-height:260px}
-.scanrow{display:flex;justify-content:space-between;align-items:center;padding:8px 11px;font-size:13px;border-bottom:1px solid #22262d}
+.row>span:first-child{color:var(--tx2);white-space:nowrap}
+.row>span:last-child{text-align:right;word-break:break-all}
+.uri{background:#0a0c10;border:1px solid var(--line);border-radius:var(--r2);
+ padding:10px 12px;font:11.5px/1.55 ui-monospace,Menlo,monospace;
+ word-break:break-all;color:#8fd0ff;margin-top:10px;cursor:pointer;transition:.15s;
+ max-height:88px;overflow:auto}
+.uri:hover{border-color:var(--pri);background:#0b1220}
+button{background:var(--pri);color:#fff;border:0;border-radius:var(--r2);
+ padding:8px 15px;font-size:13.5px;font-weight:500;cursor:pointer;
+ font-family:inherit;transition:.15s;white-space:nowrap}
+button:hover{background:var(--pri2)}
+button:active{transform:translateY(1px)}
+button:disabled{opacity:.45;cursor:not-allowed}
+.btn2{background:var(--card2);color:var(--tx);border:1px solid var(--line2)}
+.btn2:hover{background:#252b38;border-color:#3a4356}
+.btnd{background:rgba(248,113,113,.1);color:var(--err);border:1px solid rgba(248,113,113,.25)}
+.btnd:hover{background:rgba(248,113,113,.18)}
+.acts{display:flex;gap:8px;margin-top:13px;flex-wrap:wrap}
+label{display:block;font-size:12.5px;color:var(--tx2);margin:13px 0 5px;font-weight:500}
+label .hint{color:var(--tx3);font-weight:400;font-size:11.5px;margin-left:6px}
+input,select{width:100%;background:#0a0c10;border:1px solid var(--line2);
+ border-radius:var(--r2);padding:9px 11px;color:var(--tx);font-size:13.5px;
+ font-family:inherit;transition:.15s}
+input:focus,select:focus{outline:0;border-color:var(--pri);box-shadow:0 0 0 3px rgba(59,130,246,.12)}
+input::placeholder{color:var(--tx3)}
+select{cursor:pointer}
+.f2{display:grid;grid-template-columns:1fr 1fr;gap:12px}
+.f2 label{margin-top:13px}
+@media(max-width:560px){.f2{grid-template-columns:1fr}}
+.chk{display:flex;align-items:center;gap:10px;padding:8px 10px;border-radius:var(--r2);
+ cursor:pointer;margin:0;color:var(--tx);font-size:13.5px;transition:.12s}
+.chk:hover{background:var(--card2)}
+.chk input{width:16px;height:16px;accent-color:var(--pri);flex:0 0 auto;cursor:pointer}
+.chk span{flex:0 0 auto;white-space:nowrap}
+.chk i{color:var(--tx3);font-style:normal;font-size:11.5px;line-height:1.45;flex:1;min-width:0}
+.chk em{color:var(--warn);font-style:normal;font-size:11px;margin-left:7px}
+.chkbox{background:#0a0c10;border:1px solid var(--line2);border-radius:var(--r2);
+ padding:5px;max-height:220px;overflow:auto}
+details{border:1px solid var(--line);border-radius:var(--r2);margin-top:14px;
+ background:var(--bg2);overflow:hidden}
+details[open]{border-color:var(--line2)}
+summary{padding:10px 13px;cursor:pointer;font-size:13px;color:var(--tx2);
+ font-weight:500;user-select:none;list-style:none;transition:.12s}
+summary:hover{color:var(--tx);background:var(--card2)}
+summary::-webkit-details-marker{display:none}
+summary::before{content:"\25B8";display:inline-block;margin-right:8px;transition:.2s;color:var(--tx3)}
+details[open] summary::before{transform:rotate(90deg)}
+.dbody{padding:2px 13px 14px}
+.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(330px,1fr));gap:12px}
+.modal{position:fixed;inset:0;background:rgba(0,0,0,.72);backdrop-filter:blur(3px);
+ display:none;align-items:center;justify-content:center;padding:20px;z-index:99}
+.modal.show{display:flex;animation:fade .18s ease}
+@keyframes fade{from{opacity:0}to{opacity:1}}
+.mbox{background:var(--card);border:1px solid var(--line2);border-radius:16px;
+ padding:22px 24px;max-width:560px;width:100%;max-height:88vh;overflow:auto;box-shadow:var(--sh);
+ animation:pop .2s cubic-bezier(.2,.9,.3,1.2)}
+@keyframes pop{from{transform:translateY(12px) scale(.98);opacity:0}}
+.mbox h2{font-size:16.5px;font-weight:650;margin-bottom:4px}
+.toast{position:fixed;bottom:26px;left:50%;transform:translateX(-50%);
+ background:var(--card2);border:1px solid var(--line2);padding:11px 20px;
+ border-radius:11px;display:none;z-index:100;max-width:90%;font-size:13.5px;box-shadow:var(--sh)}
+.toast.show{display:block;animation:up .22s cubic-bezier(.2,.9,.3,1.2)}
+@keyframes up{from{transform:translate(-50%,14px);opacity:0}}
+.toast.err{border-color:rgba(248,113,113,.4);color:#ffb4b4}
+.toast.ok{border-color:rgba(52,211,153,.4);color:#8ff0c4}
+.alert{background:rgba(251,191,36,.07);border:1px solid rgba(251,191,36,.28);
+ color:#f5d78e;border-radius:var(--r2);padding:11px 13px;font-size:12.5px;
+ margin-bottom:10px;line-height:1.7}
+.cmd{background:#0a0c10;border:1px solid var(--line);border-radius:7px;padding:8px 10px;
+ margin-top:8px;font:11px/1.5 ui-monospace,Menlo,monospace;color:#8fd0ff;
+ word-break:break-all;user-select:all}
+.empty{text-align:center;color:var(--tx3);padding:44px 20px;font-size:13.5px}
+pre{background:#0a0c10;padding:12px;border-radius:var(--r2);overflow:auto;
+ font:11.5px/1.6 ui-monospace,Menlo,monospace;max-height:420px;color:var(--tx2)}
+.scanning{color:var(--tx2);font-size:13px;padding:12px}
+.scanlist{margin-top:8px;border:1px solid var(--line);border-radius:var(--r2);
+ overflow:auto;max-height:280px}
+.scanrow{display:flex;justify-content:space-between;align-items:center;gap:10px;
+ padding:9px 12px;font-size:13px;border-bottom:1px solid var(--line);transition:.12s}
 .scanrow:last-child{border:0}
 .scanrow b{font-weight:500;font-size:12px}
-.sok{cursor:pointer}.sok b{color:#3ddc84}
-.sok:hover{background:#1e3a2a}
-.sbad{opacity:.45}.sbad b{color:#8b93a1}
-.f2{display:grid;grid-template-columns:1fr 1fr;gap:12px}
-.f2 label{margin-top:12px}
-.chkbox{background:#0f1114;border:1px solid #2c313a;border-radius:8px;padding:6px;max-height:210px;overflow:auto}
-.chk{display:flex;align-items:center;gap:10px;padding:8px 10px;border-radius:6px;cursor:pointer;margin:0;color:#e6e8eb;font-size:14px}
-.chk:hover{background:#1a1d23}
-.chk input{width:16px;height:16px;accent-color:#2563eb;flex:0 0 auto;cursor:pointer}
-.chk i{color:#6b7280;font-style:normal;font-size:12px;margin-left:6px}
-.chk em{color:#c79b3b;font-style:normal;font-size:11px;margin-left:8px}
-label a{font-size:12px;margin-left:8px}
-.empty{text-align:center;color:#5a626e;padding:40px}
-pre{background:#0f1114;padding:12px;border-radius:8px;overflow:auto;font-size:12px;max-height:400px}
-.login{max-width:340px;margin:15vh auto}
+.sok{cursor:pointer}.sok b{color:var(--ok)}
+.sok:hover{background:rgba(52,211,153,.08)}
+.sbad{opacity:.42}.sbad b{color:var(--tx2)}
+.vtag{font-size:10px;padding:1.5px 7px;border-radius:10px;margin-left:6px}
+.vtag.pre{background:rgba(251,191,36,.14);color:var(--warn)}
+.vtag.rel{background:rgba(52,211,153,.14);color:var(--ok)}
+.vcur{background:rgba(52,211,153,.07)}
+.spin{display:inline-block;width:12px;height:12px;border:2px solid var(--line2);
+ border-top-color:var(--pri);border-radius:50%;animation:sp .7s linear infinite;
+ vertical-align:-1px;margin-right:7px}
+@keyframes sp{to{transform:rotate(360deg)}}
+.login{max-width:350px;margin:16vh auto}
+.login .card{padding:24px}
+::-webkit-scrollbar{width:9px;height:9px}
+::-webkit-scrollbar-track{background:transparent}
+::-webkit-scrollbar-thumb{background:var(--line2);border-radius:6px}
+::-webkit-scrollbar-thumb:hover{background:#3a4356}
 </style></head><body>
 <div id="login" class="wrap login" style="display:none">
   <div class="card"><h3>sing-box 面板</h3>
@@ -2059,16 +2347,11 @@ async function editNode(t0){const t=decodeURIComponent(t0);
   <button class="btn2" onclick="closeM()">取消</button></div>`;
  document.getElementById('modal').classList.add('show');
  if(spec.needs_cert&&!CERTS.length){const cr=await api('/certs');CERTS=cr.certs||[]}
- document.getElementById('fields').innerHTML=spec.fields.map(f=>{
-   const v=d.fields[f.k]!==undefined?d.fields[f.k]:(f.d||'');
-   if(f.t==='cert'){const o=CERTS.map(c=>`<option value="${c.domain}" ${c.domain===v?'selected':''}>${c.domain}</option>`).join('');
-     return `<label>${f.l}</label>${CERTS.length?`<select id="f-${f.k}">${o}</select>`:'<div style="color:#ff9b9b;font-size:13px">无可用证书</div>'}`}
-   if(f.t==='select')return `<label>${f.l}</label><select id="f-${f.k}">${f.opts.map(o=>`<option ${o===v?'selected':''}>${o}</option>`).join('')}</select>`;
-   if(f.t==='dest')return `<label>${f.l} <a href="javascript:;" onclick="scanDest()">⚡ 扫描可用目标</a></label>
-     <input id="f-${f.k}" type="text" value="${esc(v)}"><div id="scanres"></div>`;
-   return `<label>${f.l}</label><input id="f-${f.k}" type="${f.t}" value="${esc(v)}">`}).join('')}
-async function saveEdit(t0,proto){const t=decodeURIComponent(t0),fs={};
- PROTOS[proto].fields.forEach(f=>{const e=document.getElementById('f-'+f.k);if(e)fs[f.k]=e.value});
+ const gv=f=>d.fields[f.k]!==undefined?String(d.fields[f.k]):(f.d||'');
+ document.getElementById('fields').innerHTML=
+   spec.fields.map(f=>fld(f,gv(f))).join('')+advHTML(spec,gv)}
+async function saveEdit(t0,proto){const t=decodeURIComponent(t0);
+ const fs=collectF(PROTOS[proto]);
  const r=await api('/inbound-edit/'+encodeURIComponent(t),'POST',{proto:proto,fields:fs});
  if(r.ok){closeM();msg('已保存，客户端需重新拉订阅',1);loadIn();refresh()}else alert(r.msg)}
 function newNode(){const opts=Object.entries(PROTOS).map(([k,v])=>`<option value="${k}">${v.label}</option>`).join('');
@@ -2078,14 +2361,37 @@ function newNode(){const opts=Object.entries(PROTOS).map(([k,v])=>`<option value
 async function renderF(){const p=document.getElementById('proto').value,spec=PROTOS[p];
  if(spec.needs_cert&&!CERTS.length){const cr=await api('/certs');CERTS=cr.certs||[]}
  const a=await api('/autofill');
- document.getElementById('fields').innerHTML=spec.fields.map(f=>{
-  let v=f.d||'';if(f.auto)v=a[f.auto]||'';
-  if(f.t==='cert'){const o=CERTS.map(c=>`<option value="${c.domain}">${c.domain}</option>`).join('');
-   return `<label>${f.l}</label>${CERTS.length?`<select id="f-${f.k}">${o}</select>`:'<div style="color:#ff9b9b;font-size:13px">无可用证书，请先到「证书」页申请</div>'}`}
-  if(f.t==='select')return `<label>${f.l}</label><select id="f-${f.k}">${f.opts.map(o=>`<option ${o===f.d?'selected':''}>${o}</option>`).join('')}</select>`;
-  if(f.t==='dest')return `<label>${f.l} <a href="javascript:;" onclick="scanDest()">⚡ 扫描可用目标</a></label>
-   <input id="f-${f.k}" type="text" value="${esc(v)}"><div id="scanres"></div>`;
-  return `<label>${f.l}</label><input id="f-${f.k}" type="${f.t}" value="${esc(v)}">`}).join('')}
+ const gv=f=>f.auto?(a[f.auto]||''):(f.d||'');
+ document.getElementById('fields').innerHTML=
+   spec.fields.map(f=>fld(f,gv(f))).join('')+advHTML(spec,gv)}
+
+// 单个字段 -> HTML
+function fld(f,v){v=v===undefined?'':String(v);
+ const h=f.h?`<span class="hint">${esc(f.h)}</span>`:'';
+ if(f.t==='bool')return `<label class="chk"><input type="checkbox" id="f-${f.k}" ${v==='1'?'checked':''}><span>${esc(f.l)}</span>${f.h?`<i>${esc(f.h)}</i>`:''}</label>`;
+ if(f.t==='cert'){const o=CERTS.map(c=>`<option value="${c.domain}" ${c.domain===v?'selected':''}>${c.domain}</option>`).join('');
+  return `<label>${esc(f.l)}${h}</label>`+(CERTS.length?`<select id="f-${f.k}">${o}</select>`:`<div class="alert">无可用证书，请先到「证书」页申请</div>`)}
+ if(f.t==='select')return `<label>${esc(f.l)}${h}</label><select id="f-${f.k}">${f.opts.map(o=>`<option ${o===v?'selected':''}>${esc(o)}</option>`).join('')}</select>`;
+ if(f.t==='dest')return `<label>${esc(f.l)} <a href="javascript:;" onclick="scanDest()">⚡ 扫描可用目标</a></label>
+  <input id="f-${f.k}" type="text" value="${esc(v)}"><div id="scanres"></div>`;
+ return `<label>${esc(f.l)}${h}</label><input id="f-${f.k}" type="${f.t}" value="${esc(v)}">`}
+
+const TRKEYS=['transport','tr_path','tr_host','tr_ed'];
+// 高级选项折叠区
+function advHTML(spec,gv){const a=spec.adv||[];if(!a.length)return '';
+ const perf=a.filter(f=>TRKEYS.indexOf(f.k)<0),tr=a.filter(f=>TRKEYS.indexOf(f.k)>=0);
+ let out='';
+ if(perf.length)out+=`<details><summary>高级选项 · 性能与抗封锁（${perf.length}）</summary>
+  <div class="dbody">${perf.map(f=>fld(f,gv(f))).join('')}</div></details>`;
+ if(tr.length)out+=`<details><summary>传输层设置（可过 CDN）</summary>
+  <div class="dbody">${tr.map(f=>fld(f,gv(f))).join('')}</div></details>`;
+ return out}
+
+// 收集表单（含高级选项）
+function collectF(spec){const fs={};
+ (spec.fields||[]).concat(spec.adv||[]).forEach(f=>{const e=document.getElementById('f-'+f.k);
+  if(e)fs[f.k]=(f.t==='bool')?(e.checked?'1':'0'):e.value});
+ return fs}
 async function scanDest(){const box=document.getElementById('scanres');
  box.innerHTML='<div class="scanning">扫描中，约 8 秒…</div>';
  const r=await api('/scan');
@@ -2099,8 +2405,8 @@ async function scanDest(){const box=document.getElementById('scanres');
    <div style="color:#6b7280;font-size:12px;margin-top:6px">点击绿色条目即可选用（需 TLS1.3 + H2 才合格）</div>`}
 function pickDest(h){document.getElementById('f-dest').value=h;
  document.getElementById('scanres').innerHTML='';msg('已选用 '+h,1)}
-async function saveNode(){const p=document.getElementById('proto').value,fs={};
- PROTOS[p].fields.forEach(f=>{const e=document.getElementById('f-'+f.k);if(e)fs[f.k]=e.value});
+async function saveNode(){const p=document.getElementById('proto').value;
+ const fs=collectF(PROTOS[p]);
  const r=await api('/inbounds','POST',{proto:p,fields:fs});
  if(r.ok){closeM();msg('节点已创建',1);loadIn();refresh()}else msg(r.msg)}
 async function delIn(t0){const t=decodeURIComponent(t0);if(!confirm('删除节点 '+t+'?'))return;const r=await api('/inbounds/'+encodeURIComponent(t),'DELETE');
@@ -2287,6 +2593,8 @@ class QuietMixin:
 
 class Handler(QuietMixin, BaseHTTPRequestHandler):
     server_version = "sb-panel"
+    protocol_version = "HTTP/1.1"  # 复用连接：一次握手跑完整页所有 API
+    disable_nagle_algorithm = True  # 小响应立即发出，省 40ms
     timeout = 30                  # 单个请求最长 30 秒，避免僵死占用线程
 
     def log_message(self, *a):
@@ -2294,11 +2602,24 @@ class Handler(QuietMixin, BaseHTTPRequestHandler):
 
     def _send(self, code, data, ctype="application/json"):
         HEARTBEAT["t"] = time.time()
+        self._sent = True
         body = data if isinstance(data, bytes) else json.dumps(data, ensure_ascii=False).encode()
+        enc = ""
+        if len(body) > 1024 and "gzip" in self.headers.get("Accept-Encoding", ""):
+            try:
+                body, enc = gzip.compress(body, 6), "gzip"
+            except Exception:
+                enc = ""
         self.send_response(code)
         self.send_header("Content-Type", ctype + ("; charset=utf-8" if "json" in ctype or "html" in ctype else ""))
         self.send_header("Content-Length", str(len(body)))
+        if enc:
+            self.send_header("Content-Encoding", enc)
+            self.send_header("Vary", "Accept-Encoding")
         self.send_header("X-Content-Type-Options", "nosniff")
+        if "html" in ctype:
+            # 面板升级后立刻生效，不让浏览器拿旧界面
+            self.send_header("Cache-Control", "no-store, must-revalidate")
         self.end_headers()
         self.wfile.write(body)
 
@@ -2330,16 +2651,32 @@ class Handler(QuietMixin, BaseHTTPRequestHandler):
             return p[len(base):]
         return None
 
-    def do_GET(self):
+    def _guard(self, fn):
+        """统一兜底：任何情况下都要回一个响应，否则 keep-alive 连接会挂死"""
         try:
-            return self._do_GET()
+            r = fn()
         except Exception as e:
             import traceback
             traceback.print_exc()
             try:
                 return self._send(500, {"ok": False, "msg": f"服务端错误: {e}"})
             except Exception:
-                pass
+                return
+        if r is None and not getattr(self, "_sent", False):
+            try:
+                return self._send(404, {"ok": False, "msg": "未知接口"})
+            except Exception:
+                return
+        return r
+
+    def do_GET(self):
+        return self._guard(self._do_GET)
+
+    def do_POST(self):
+        return self._guard(self._do_POST)
+
+    def do_DELETE(self):
+        return self._guard(self._do_DELETE)
 
     def _do_GET(self):
         raw = urllib.parse.urlparse(self.path).path
@@ -2485,7 +2822,7 @@ class Handler(QuietMixin, BaseHTTPRequestHandler):
                 })
         return self._send(404, {"ok": False})
 
-    def do_POST(self):
+    def _do_POST(self):
         p = self._strip_base(urllib.parse.urlparse(self.path).path)
         if p is None:
             return self._send(404, {"ok": False})
@@ -2636,7 +2973,7 @@ class Handler(QuietMixin, BaseHTTPRequestHandler):
                                         "msg": "面板将在 2 秒后重启，请用新地址访问"})
         return self._send(404, {"ok": False})
 
-    def do_DELETE(self):
+    def _do_DELETE(self):
         if not self._auth():
             return self._send(401, {"ok": False})
         p = self._strip_base(urllib.parse.urlparse(self.path).path)

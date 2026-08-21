@@ -952,14 +952,13 @@ clean_disk() {
 do_uninstall() {
     title "完全卸载"
     echo "  将删除: 服务 / 程序 / 配置 / 节点 / 证书 / 快捷命令 / BBR调优 / 端口跳跃规则"
-    echo "          以及 Xray-core（若已安装）"
     read -rp "$(echo -e "${RED}确认卸载? 输入 yes: ${NC}")" c
     [[ "$c" != "yes" ]] && { warn "已取消"; return 0; }
 
     local bk="/root/singbox-backup-$(date +%Y%m%d%H%M).tar.gz"
     tar -czf "$bk" -C / etc/sing-box 2>/dev/null && ok "配置已备份到 $bk"
 
-    for s in sing-box singbox-panel singbox-sub xray; do
+    for s in sing-box singbox-panel singbox-sub; do
         systemctl disable --now "$s" >/dev/null 2>&1
         rm -f "/etc/systemd/system/${s}.service"
     done
@@ -978,8 +977,7 @@ do_uninstall() {
         ok "已清理 $n 条端口跳跃规则"
     fi
 
-    rm -rf "$SB_DIR" "$SB_ETC" /usr/local/xray /etc/xray \
-           /usr/local/bin/s /etc/sysctl.d/99-singbox.conf
+    rm -rf "$SB_DIR" "$SB_ETC" /usr/local/bin/s /etc/sysctl.d/99-singbox.conf
     sysctl --system >/dev/null 2>&1
 
     if [[ -d "$HOME/.acme.sh" ]]; then
@@ -997,14 +995,6 @@ do_uninstall() {
 show_status() {
     title "当前状态"
     echo -e "  sing-box 版本 : ${GREEN}$(current_version || echo 未安装)${NC}"
-    if [[ -x /usr/local/xray/xray ]]; then
-        local xv; xv=$(/usr/local/xray/xray version 2>/dev/null | head -1 | awk '{print $2}')
-        if systemctl is-active --quiet xray; then
-            echo -e "  Xray-core     : ${GREEN}${xv:-已安装} (运行中)${NC}"
-        else
-            echo -e "  Xray-core     : ${YELLOW}${xv:-已安装} (未运行/无节点)${NC}"
-        fi
-    fi
     if systemctl is-active --quiet sing-box; then
         echo -e "  运行状态      : ${GREEN}运行中${NC}"
     else

@@ -1414,6 +1414,37 @@ def rebuild_sub():
 # ════════════════════════════════════════════
 # API
 # ════════════════════════════════════════════
+LOG_LEVELS = ["trace", "debug", "info", "warn", "error", "fatal", "panic"]
+
+
+def api_log_state():
+    lg = cfg().get("log") or {}
+    return {"enabled": not lg.get("disabled", False),
+            "level": lg.get("level", "warn"),
+            "levels": LOG_LEVELS}
+
+
+def api_set_log(enabled, level=None):
+    """开关 sing-box 日志。关闭后不再写 journald，省磁盘与 IO"""
+    c = cfg()
+    lg = dict(c.get("log") or {})
+    if enabled:
+        lg.pop("disabled", None)
+        lv = (level or lg.get("level") or "warn").strip()
+        if lv not in LOG_LEVELS:
+            return False, f"未知日志级别：{lv}"
+        lg["level"] = lv
+        lg.setdefault("timestamp", True)
+    else:
+        lg["disabled"] = True
+    c["log"] = lg
+    okk, msg = apply_config(c)
+    if not okk:
+        return False, msg
+    return True, ("日志已开启（级别 " + lg["level"] + "）" if enabled
+                  else "日志已关闭，sing-box 不再写入 journald")
+
+
 def api_status():
     _, ver, _ = sh(f"{SB_BIN} version")
     ver = ver.splitlines()[0].split()[-1] if ver else "未知"
@@ -2128,7 +2159,11 @@ body.mopen{overflow:hidden}      /* 弹窗打开时锁住背景，避免滚轮�
  <div class="uri" id="suburl" onclick="cp(this.textContent)"></div>
  <div id="subinfo" style="margin-top:12px"></div></div></div>
 <div id="v-ver" style="display:none"><div id="verbox"></div></div>
-<div id="v-log" style="display:none"><div class="card"><div class="acts" style="margin-bottom:10px"><button class="btn2" onclick="loadLog()">刷新</button></div><pre id="logbox"></pre></div></div>
+<div id="v-log" style="display:none"><div class="card">
+ <h3>sing-box 日志 <span id="log-badge" class="badge">…</span></h3>
+ <div id="log-ctl"></div>
+ <div class="acts" style="margin-bottom:10px"><button class="btn2" onclick="loadLog()">刷新</button></div>
+ <pre id="logbox"></pre></div></div>
 </div></div>
 <div class="modal" id="modal"><div class="mbox" id="mbox"></div></div>
 <div class="toast" id="toast"></div>
@@ -2342,7 +2377,31 @@ async function saveSubToken(){
   <div class="uri" onclick="cp(this.textContent)">${esc(r.url)}</div>
   <p style="color:#f0c674;font-size:12px;margin-top:8px">旧地址已失效，请更新所有客户端</p>
   <div class="acts"><button onclick="closeM();loadSub()">完成</button></div>`}
-async function loadLog(){const r=await api('/logs');document.getElementById('logbox').textContent=r.log}
+async function loadLog(){const r=await api('/logs');
+ const st=r.state||await api('/log-state');
+ renderLogCtl(st);
+ document.getElementById('logbox').textContent=
+   st.enabled?(r.log||'（暂无日志）'):'日志已关闭。开启后 sing-box 才会写入 journald。';}
+
+function renderLogCtl(st){
+ document.getElementById('log-badge').outerHTML=st.enabled
+  ?`<span id="log-badge" class="badge" style="background:#1e3a2a;color:#8ff0b5">已开启 · ${esc(st.level)}</span>`
+  :'<span id="log-badge" class="badge">已关闭</span>';
+ document.getElementById('log-ctl').innerHTML=st.enabled?`
+  <label>日志级别 <span class="hint">越靠后越安静。warn / error 适合长期开着</span></label>
+  <select id="log-lv">${(st.levels||[]).map(v=>`<option ${v===st.level?'selected':''}>${v}</option>`).join('')}</select>
+  <div class="acts"><button class="btn2" onclick="setLog(1)">应用级别</button>
+   <button class="btnd" onclick="setLog(0)">关闭日志</button></div>
+  <p style="color:#8b93a1;font-size:12px;margin-top:6px">改动会重启 sing-box，已连接的会话会断一下</p>`
+  :`<div class="alert">日志已关闭，sing-box 不再写 journald —— 省磁盘和 IO，但出问题时也查不到原因。</div>
+   <div class="acts"><button onclick="setLog(1)">开启日志</button></div>`}
+
+async function setLog(on){
+ const lv=document.getElementById('log-lv');
+ if(!on&&!confirm('关闭日志后 sing-box 不再记录任何信息，排查故障会很困难。\n\n会重启 sing-box，确定关闭？'))return;
+ const r=await api('/set-log','POST',{enabled:!!on,level:lv?lv.value:undefined});
+ msg(r.msg,r.ok?1:0);
+ if(r.ok){setTimeout(()=>{loadLog();refresh()},1200)}}
 function esc(s){return String(s).replace(/[<>&"]/g,c=>({'<':'&lt;','>':'&gt;','&':'&amp;','"':'&quot;'}[c]))}
 async function editNode(t0){const t=decodeURIComponent(t0);
  const d=await api('/inbound-detail/'+encodeURIComponent(t));
@@ -2812,8 +2871,13 @@ class Handler(QuietMixin, BaseHTTPRequestHandler):
             if p == "/api/disk":
                 return self._send(200, disk_report())
             if p == "/api/logs":
+                st = api_log_state()
+                if not st["enabled"]:
+                    return self._send(200, {"log": "", "state": st})
                 _, log, _ = sh("journalctl -u sing-box -n 80 --no-pager")
-                return self._send(200, {"log": log})
+                return self._send(200, {"log": log, "state": st})
+            if p == "/api/log-state":
+                return self._send(200, api_log_state())
             if p.startswith("/api/test/"):
                 tag = urllib.parse.unquote(p[len("/api/test/"):])
                 return self._send(200, api_test_outbound(tag))
@@ -2898,6 +2962,9 @@ class Handler(QuietMixin, BaseHTTPRequestHandler):
                 return self._send(200, {"ok": True,
                                         "msg": ("已清理：" + "、".join(freed)) if freed else "没有可清理的内容",
                                         "disk": disk_report()})
+            if p == "/api/set-log":
+                okk, m2 = api_set_log(bool(b.get("enabled")), b.get("level"))
+                return self._send(200, {"ok": okk, "msg": m2})
             if p == "/api/restart":
                 c, _, _ = sh("systemctl restart sing-box")
                 return self._send(200, {"ok": c == 0})

@@ -117,6 +117,12 @@ def rand_port():
     return secrets.randbelow(40000) + 20000
 
 
+def rand_spiderx():
+    """SpiderX：/ + 15 位随机字母数字，与 3x-ui 同格式"""
+    al = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+    return "/" + "".join(secrets.choice(al) for _ in range(15))
+
+
 def gen_uuid():
     c, o, _ = sh(f"{SB_BIN} generate uuid")
     return o.strip() if c == 0 and o else ""
@@ -1538,8 +1544,8 @@ XADV_REALITY = [
      "h": "低于此版本的 Xray 客户端会被拒绝。1.0.0 等于不限制"},
     {"k": "max_client", "l": "最大客户端版本", "t": "text", "d": "",
      "h": "留空 = 不限制。格式 x.y.z"},
-    {"k": "spiderx", "l": "SpiderX", "t": "text", "d": "/",
-     "h": "客户端爬取目标站的起始路径，写进分享链接"},
+    {"k": "spiderx", "l": "SpiderX", "t": "text", "d": "/", "auto": "spiderx", "gen": 1,
+     "h": "客户端爬取目标站的起始路径，写进分享链接。点右侧 ↻ 换一个"},
 ]
 
 _XADV_MAP = {
@@ -2996,6 +3002,12 @@ select{cursor:pointer}
 .chk em{color:var(--warn);font-style:normal;font-size:11px;margin-left:7px}
 .chkbox{background:#0a0c10;border:1px solid var(--line2);border-radius:var(--r2);
  padding:5px;max-height:220px;overflow:auto}
+.ingrp{display:flex;gap:0}
+.ingrp input{border-top-right-radius:0;border-bottom-right-radius:0;border-right:0}
+.gen{background:var(--card2);color:var(--tx2);border:1px solid var(--line2);
+ border-top-left-radius:0;border-bottom-left-radius:0;padding:0 14px;font-size:16px;
+ line-height:1;flex:0 0 auto;transition:.15s}
+.gen:hover{background:#252b38;color:var(--pri)}
 .ftabs{display:flex;gap:2px;margin:16px 0 4px;border-bottom:1px solid var(--line);
  overflow-x:auto;scrollbar-width:none}
 .ftabs::-webkit-scrollbar{display:none}
@@ -3443,7 +3455,15 @@ function fld(f,v){v=v===undefined?'':String(v);
  if(f.t==='select')return `<label>${esc(f.l)}${h}</label><select id="f-${f.k}">${f.opts.map(o=>`<option ${o===v?'selected':''}>${esc(o)}</option>`).join('')}</select>`;
  if(f.t==='dest')return `<label>${esc(f.l)} <a href="javascript:;" onclick="scanDest()">⚡ 扫描可用目标</a></label>
   <input id="f-${f.k}" type="text" value="${esc(v)}"><div id="scanres"></div>`;
+ if(f.gen)return `<label>${esc(f.l)}${h}</label><div class="ingrp">
+  <input id="f-${f.k}" type="${f.t}" value="${esc(v)}">
+  <button type="button" class="gen" title="重新生成" onclick="regenF('${f.k}')">↻</button></div>`;
  return `<label>${esc(f.l)}${h}</label><input id="f-${f.k}" type="${f.t}" value="${esc(v)}">`}
+
+// 点 ↻ 重新生成某个字段
+async function regenF(k){const e=document.getElementById('f-'+k);if(!e)return;
+ try{const a=await api('/autofill');if(a[k]!==undefined){e.value=a[k];msg('已重新生成',1)}}
+ catch(err){msg('生成失败')}}
 
 const GROUPS=['基础配置','协议','传输','安全','嗅探','高级配置'];
 // 按分组渲染成标签页（所有字段都留在 DOM 里，切换只改显示）
@@ -3857,6 +3877,7 @@ class Handler(QuietMixin, BaseHTTPRequestHandler):
                 return self._send(200, {"port": rand_port(), "uuid": gen_uuid(),
                                         "pass": secrets.token_urlsafe(12),
                                         "sspass": base64.b64encode(secrets.token_bytes(16)).decode(),
+                                        "spiderx": rand_spiderx(),
                                         "ip": addr, "rawip": public_ip()})
             if p == "/api/sub":
                 tok = rebuild_sub()

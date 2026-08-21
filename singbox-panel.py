@@ -1998,8 +1998,8 @@ body{background:var(--bg);color:var(--tx);
 a{color:var(--pri);text-decoration:none}
 a:hover{opacity:.8}
 .wrap{max-width:1180px;margin:0 auto;padding:0 20px 48px}
-header{position:sticky;top:0;z-index:20;background:rgba(13,15,19,.85);
- backdrop-filter:blur(12px);border-bottom:1px solid var(--line);
+header{position:sticky;top:0;z-index:20;background:var(--bg);
+ border-bottom:1px solid var(--line);
  display:flex;align-items:center;gap:20px;padding:14px 0;margin-bottom:22px;flex-wrap:wrap}
 h1{font-size:16px;font-weight:650;letter-spacing:.2px;white-space:nowrap}
 .stat{display:flex;gap:16px;font-size:12.5px;color:var(--tx2);flex-wrap:wrap;flex:1}
@@ -2072,7 +2072,7 @@ summary::before{content:"\25B8";display:inline-block;margin-right:8px;transition
 details[open] summary::before{transform:rotate(90deg)}
 .dbody{padding:2px 13px 14px}
 .grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(330px,1fr));gap:12px}
-.modal{position:fixed;inset:0;background:rgba(0,0,0,.72);backdrop-filter:blur(3px);
+.modal{position:fixed;inset:0;background:rgba(0,0,0,.8);
  display:none;align-items:flex-start;justify-content:center;
  padding:4vh 20px 20px;z-index:99;overscroll-behavior:contain}
 .modal.show{display:flex;animation:fade .18s ease}
@@ -2081,7 +2081,11 @@ details[open] summary::before{transform:rotate(90deg)}
  padding:22px 24px;max-width:560px;width:100%;max-height:92vh;overflow-y:auto;
  box-shadow:var(--sh);animation:pop .2s cubic-bezier(.2,.9,.3,1.2);
  overscroll-behavior:contain;   /* 滚到头不传导给背景页，消除跳动 */
- scrollbar-gutter:stable}
+ scrollbar-gutter:stable;
+ transform:translateZ(0);       /* 独立合成层，滚动不牵连祖先重绘 */
+ contain:paint}
+/* 滚动过程中临时关掉 hover，避免行块从光标下经过时一亮一暗 */
+.mbox.scrolling *{pointer-events:none}
 @keyframes pop{from{transform:translateY(12px) scale(.98);opacity:0}}
 .mbox h2{font-size:16.5px;font-weight:650;margin-bottom:4px}
 .toast{position:fixed;bottom:26px;left:50%;transform:translateX(-50%);
@@ -2633,6 +2637,16 @@ async function pollCert(){
  }
  const box=document.getElementById('cstat');if(box)box.textContent='超时，请查看服务器日志';}
 async function restart(){const r=await api('/restart','POST');msg(r.ok?'已重启':'失败',r.ok);refresh()}
+// 滚动时给弹窗打标记：期间屏蔽 hover，滚停 120ms 后恢复
+(function(){let t=null;
+ document.addEventListener('scroll',e=>{
+   const el=e.target;
+   if(!el||el.nodeType!==1||el.id!=='mbox')return;
+   el.classList.add('scrolling');
+   clearTimeout(t);
+   t=setTimeout(()=>el.classList.remove('scrolling'),120);
+ },true);})();
+
 // 弹窗开关时锁/解锁背景页滚动。用观察者兜住所有打开入口，不用逐个改调用点
 (function(){const md=document.getElementById('modal');
  new MutationObserver(()=>{

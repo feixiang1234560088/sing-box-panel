@@ -27,7 +27,7 @@ if [[ -d /etc/sing-box ]]; then
 fi
 
 # 停止并删除服务
-for s in sing-box singbox-panel singbox-sub; do
+for s in sing-box singbox-panel singbox-sub xray; do
     systemctl disable --now "$s" >/dev/null 2>&1
     rm -f "/etc/systemd/system/${s}.service"
 done
@@ -48,6 +48,8 @@ done
 # 删除文件
 rm -rf /usr/local/sing-box
 rm -rf /etc/sing-box
+rm -rf /usr/local/xray
+rm -rf /etc/xray
 rm -f /usr/local/bin/s
 rm -f /etc/sysctl.d/99-singbox.conf
 sysctl --system >/dev/null 2>&1

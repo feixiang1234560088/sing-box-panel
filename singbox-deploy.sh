@@ -604,7 +604,12 @@ install_panel() {
     fi
     chmod 700 "$PANEL_PY"
 
-    local pw pw2
+    local usr pw pw2
+    while true; do
+        ask "设置面板用户名" "admin"; usr="$ANS"
+        [[ "$usr" =~ ^[A-Za-z0-9_.-]{2,32}$ ]] && break
+        err "用户名需 2-32 位字母/数字/_/-/."
+    done
     while true; do
         read -rsp "$(echo -e "${BLUE}?${NC} 设置面板密码: ")" pw; echo
         [[ ${#pw} -lt 6 ]] && { err "至少 6 位"; continue; }
@@ -629,8 +634,8 @@ install_panel() {
     hash=$(printf '%s' "${pw}${salt}" | sha256sum | awk '{print $1}')
     token=$(rand_hex 16)
     jq -n --arg s "$salt" --arg h "$hash" --arg ho "$host" --arg pa "$ppath" \
-          --argjson p "$pport" --argjson sp "$sport" --arg t "$token" \
-        '{salt:$s, pwhash:$h, host:$ho, port:$p, path:$pa, sub_port:$sp, sub_token:$t}' > "$PANEL_CFG_F"
+          --argjson p "$pport" --argjson sp "$sport" --arg t "$token" --arg u "$usr" \
+        '{username:$u, salt:$s, pwhash:$h, host:$ho, port:$p, path:$pa, sub_port:$sp, sub_token:$t}' > "$PANEL_CFG_F"
     chmod 600 "$PANEL_CFG_F"
 
     cat > /etc/systemd/system/singbox-panel.service <<EOF
@@ -678,6 +683,7 @@ panel_info() {
     port=$(jq -r '.port // 2095' "$PANEL_CFG_F")
     sport=$(jq -r '.sub_port // 8080' "$PANEL_CFG_F")
     dom=$(jq -r '.tls_domain // ""' "$PANEL_CFG_F")
+    local usr; usr=$(jq -r '.username // "(未设置，任意用户名可登录)"' "$PANEL_CFG_F")
     path=$(jq -r '.path // ""' "$PANEL_CFG_F")
     [[ -n "$path" ]] && path="/${path#/}"
     ip=$(get_ip)
@@ -710,6 +716,7 @@ panel_info() {
     fi
     echo -e "    访问路径   : ${path:-/ (未设置，建议设置以防扫描)}"
     echo -e "    HTTPS      : ${dom:-未启用}"
+    echo -e "    登录用户名 : ${GREEN}${usr}${NC}"
     echo -e "    登录密码   : ${YELLOW}已加密存储，忘记可用菜单重置${NC}"
     echo
     echo -e "  ${BOLD}订阅${NC}"
@@ -854,7 +861,14 @@ panel_set_path() {
 
 panel_reset_pw() {
     [[ ! -f "$PANEL_CFG_F" ]] && { warn "面板未安装"; return 1; }
-    local pw pw2
+    local cur usr pw pw2
+    cur=$(jq -r '.username // "admin"' "$PANEL_CFG_F")
+    echo -e "  当前用户名: ${BOLD}${cur}${NC}"
+    while true; do
+        ask "新用户名 (回车保持不变)" "$cur"; usr="$ANS"
+        [[ "$usr" =~ ^[A-Za-z0-9_.-]{2,32}$ ]] && break
+        err "用户名需 2-32 位字母/数字/_/-/."
+    done
     while true; do
         read -rsp "$(echo -e "${BLUE}?${NC} 新密码: ")" pw; echo
         [[ ${#pw} -lt 6 ]] && { err "至少 6 位"; continue; }
@@ -865,10 +879,11 @@ panel_reset_pw() {
     salt=$(rand_hex 8)
     hash=$(printf '%s' "${pw}${salt}" | sha256sum | awk '{print $1}')
     tmp=$(mktemp)
-    jq --arg s "$salt" --arg h "$hash" '.salt=$s|.pwhash=$h' "$PANEL_CFG_F" > "$tmp" && mv "$tmp" "$PANEL_CFG_F"
+    jq --arg u "$usr" --arg s "$salt" --arg h "$hash" \
+       '.username=$u|.salt=$s|.pwhash=$h' "$PANEL_CFG_F" > "$tmp" && mv "$tmp" "$PANEL_CFG_F"
     chmod 600 "$PANEL_CFG_F"
     systemctl restart singbox-panel
-    ok "密码已重置，所有登录会话失效"
+    ok "用户名与密码已重置（用户名: ${usr}），所有登录会话失效"
 }
 
 panel_menu() {
@@ -886,7 +901,7 @@ panel_menu() {
   1) 查看完整信息 (地址 / 路径 / 订阅)
   2) 一键配置域名访问 (证书+HTTPS+订阅) ★
   3) 设置访问路径 (防扫描)
-  4) 重置登录密码
+  4) 重置登录用户名和密码
   ─────────────────────────
   ─────────────────────────
   5) 安装 / 重装面板
@@ -937,13 +952,14 @@ clean_disk() {
 do_uninstall() {
     title "完全卸载"
     echo "  将删除: 服务 / 程序 / 配置 / 节点 / 证书 / 快捷命令 / BBR调优 / 端口跳跃规则"
+    echo "          以及 Xray-core（若已安装）"
     read -rp "$(echo -e "${RED}确认卸载? 输入 yes: ${NC}")" c
     [[ "$c" != "yes" ]] && { warn "已取消"; return 0; }
 
     local bk="/root/singbox-backup-$(date +%Y%m%d%H%M).tar.gz"
     tar -czf "$bk" -C / etc/sing-box 2>/dev/null && ok "配置已备份到 $bk"
 
-    for s in sing-box singbox-panel singbox-sub; do
+    for s in sing-box singbox-panel singbox-sub xray; do
         systemctl disable --now "$s" >/dev/null 2>&1
         rm -f "/etc/systemd/system/${s}.service"
     done
@@ -962,7 +978,8 @@ do_uninstall() {
         ok "已清理 $n 条端口跳跃规则"
     fi
 
-    rm -rf "$SB_DIR" "$SB_ETC" /usr/local/bin/s /etc/sysctl.d/99-singbox.conf
+    rm -rf "$SB_DIR" "$SB_ETC" /usr/local/xray /etc/xray \
+           /usr/local/bin/s /etc/sysctl.d/99-singbox.conf
     sysctl --system >/dev/null 2>&1
 
     if [[ -d "$HOME/.acme.sh" ]]; then
@@ -980,6 +997,14 @@ do_uninstall() {
 show_status() {
     title "当前状态"
     echo -e "  sing-box 版本 : ${GREEN}$(current_version || echo 未安装)${NC}"
+    if [[ -x /usr/local/xray/xray ]]; then
+        local xv; xv=$(/usr/local/xray/xray version 2>/dev/null | head -1 | awk '{print $2}')
+        if systemctl is-active --quiet xray; then
+            echo -e "  Xray-core     : ${GREEN}${xv:-已安装} (运行中)${NC}"
+        else
+            echo -e "  Xray-core     : ${YELLOW}${xv:-已安装} (未运行/无节点)${NC}"
+        fi
+    fi
     if systemctl is-active --quiet sing-box; then
         echo -e "  运行状态      : ${GREEN}运行中${NC}"
     else

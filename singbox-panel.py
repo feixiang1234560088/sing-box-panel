@@ -26,6 +26,13 @@ PANEL_CFG = f"{SB_ETC}/panel.json"
 SUB_DIR = f"{SB_ETC}/sub"
 META_FILE = f"{SB_ETC}/nodemeta.json"   # tag -> 分享链接/展示信息
 
+# ── Xray-core（第二核心，可选安装）──
+XR_BIN = "/usr/local/xray/xray"
+XR_ETC = "/etc/xray"
+XR_CONF = f"{XR_ETC}/config.json"
+XR_SVC = "xray"
+DEFAULT_CORE = "sing-box"
+
 LOCK = threading.Lock()
 SESSIONS = {}
 SESSION_TTL = 8 * 3600
@@ -91,7 +98,7 @@ def public_ip(force=False):
 def rand_port():
     """随机可用端口。纯 Python 探测，不起子进程，最多尝试 30 次。"""
     import socket as _sk
-    used = {i.get("listen_port") for i in cfg().get("inbounds", [])}
+    used = used_ports()
     for _ in range(30):
         p = secrets.randbelow(40000) + 20000
         if p in used:
@@ -588,6 +595,626 @@ def apply_config(new_cfg):
     return True, "ok"
 
 
+# ════════════════════════════════════════════
+# Xray-core：inbound 生成
+# ════════════════════════════════════════════
+def _dur_ms(v):
+    """'1m' / '30s' / '1h' -> 毫秒"""
+    m = re.match(r"^(\d+)([smh])$", str(v).strip())
+    if not m:
+        return 0
+    n = int(m.group(1))
+    return n * {"s": 1000, "m": 60000, "h": 3600000}[m.group(2)]
+
+
+def gen_reality_x():
+    """优先用 xray 自己生成密钥；两核心的 Reality 都是 X25519，格式互通"""
+    if xr_installed():
+        c, o, _ = sh(f"{XR_BIN} x25519")
+        priv = pub = ""
+        for line in o.splitlines():
+            low = line.lower()
+            if "private" in low:
+                priv = line.split()[-1]
+            elif "public" in low or "password" in low:
+                pub = line.split()[-1]
+        if priv and pub:
+            return priv, pub
+    return gen_reality()
+
+
+def apply_advanced_x(ib, ss, uri, proto, f):
+    """把高级选项写进 Xray inbound / streamSettings，并同步修正分享链接"""
+    keys = {a["k"] for a in (PROTOCOLS.get(proto, {}).get("adv_xray") or [])}
+    if not keys:
+        return ib, ss, uri
+
+    sock = {}
+    if "tfo" in keys and _bl(f, "tfo"):
+        sock["tcpFastOpen"] = True
+    if "mptcp" in keys and _bl(f, "mptcp"):
+        sock["tcpMptcp"] = True
+    if sock:
+        ss["sockopt"] = sock
+
+    if "tls_min" in keys and ss.get("security") == "tls":
+        t = ss.setdefault("tlsSettings", {})
+        t["minVersion"] = "1.2" if f.get("tls_min") == "1.2" else "1.3"
+        a = f.get("alpn", "不设置")
+        if a != "不设置":
+            t["alpn"] = [x.strip() for x in a.split(",") if x.strip()]
+            if uri.startswith(("vless://", "trojan://")):
+                uri = _uq(uri, alpn=a)
+
+    if "transport" in keys:
+        sel = f.get("transport", "")
+        raw = (f.get("tr_path") or "/").strip()
+        host = (f.get("tr_host") or "").strip()
+        path = raw if raw.startswith("/") else "/" + raw
+        kind = ""
+        if sel.startswith("WebSocket"):
+            kind = "ws"
+            ss["network"] = "ws"
+            w = {"path": path}
+            if host:
+                w["host"] = host
+            ss["wsSettings"] = w
+        elif sel.startswith("gRPC"):
+            kind = "grpc"
+            ss["network"] = "grpc"
+            ss["grpcSettings"] = {"serviceName": raw.lstrip("/") or "grpc"}
+            path = raw.lstrip("/") or "grpc"
+        elif sel.startswith("HTTPUpgrade"):
+            kind = "httpupgrade"
+            ss["network"] = "httpupgrade"
+            h = {"path": path}
+            if host:
+                h["host"] = host
+            ss["httpupgradeSettings"] = h
+        elif sel.startswith("XHTTP"):
+            kind = "xhttp"
+            ss["network"] = "xhttp"
+            x = {"path": path, "mode": "auto"}
+            if host:
+                x["host"] = host
+            ss["xhttpSettings"] = x
+        elif sel.startswith("mKCP"):
+            kind = "kcp"
+            ss["network"] = "kcp"
+            k = {"header": {"type": f.get("kcp_header", "none") or "none"},
+                 "uplinkCapacity": 100, "downlinkCapacity": 100,
+                 "congestion": True, "mtu": 1350, "tti": 50,
+                 "readBufferSize": 2, "writeBufferSize": 2}
+            if (f.get("kcp_seed") or "").strip():
+                k["seed"] = f["kcp_seed"].strip()
+            ss["kcpSettings"] = k
+
+        if kind:
+            # vision 流控只能配原始 TCP
+            for cl in ((ib.get("settings") or {}).get("clients") or []):
+                cl.pop("flow", None)
+            if uri.startswith("vmess://"):
+                try:
+                    vm = json.loads(base64.b64decode(uri[8:] + "==").decode())
+                    vm["net"] = kind
+                    if kind == "kcp":
+                        # vmess 链接里 kcp 用 type=伪装类型、path=seed
+                        vm["type"] = f.get("kcp_header", "none") or "none"
+                        vm["path"] = (f.get("kcp_seed") or "").strip()
+                    else:
+                        vm["path"] = path
+                    if host:
+                        vm["host"] = host
+                    uri = "vmess://" + b64(json.dumps(vm, ensure_ascii=False))
+                except Exception:
+                    pass
+            else:
+                kw = {"type": kind, "flow": None}
+                kw["serviceName" if kind == "grpc" else "path"] = path
+                if host:
+                    kw["host"] = host
+                if kind == "kcp":
+                    kw["headerType"] = f.get("kcp_header", "none")
+                    if (f.get("kcp_seed") or "").strip():
+                        kw["seed"] = f["kcp_seed"].strip()
+                uri = _uq(uri, **kw)
+    return ib, ss, uri
+
+
+def _sb_ob_to_xray(o):
+    """sing-box 出站 -> Xray 出站（出站仍在 sing-box 侧统一管理，这里只做镜像）"""
+    t, tag = o.get("type"), o.get("tag")
+    addr = o.get("server")
+    try:
+        port = int(o.get("server_port") or 0)
+    except (TypeError, ValueError):
+        return None
+    if not addr or not port or t not in ("socks", "http"):
+        return None
+    srv = {"address": addr, "port": port}
+    if o.get("username"):
+        srv["users"] = [{"user": o["username"], "pass": o.get("password", "")}]
+    x = {"tag": tag, "protocol": t, "settings": {"servers": [srv]}}
+    tls = o.get("tls") or {}
+    if t == "http" and tls.get("enabled"):
+        x["streamSettings"] = {"security": "tls",
+                               "tlsSettings": {"serverName": tls.get("server_name") or addr}}
+    return x
+
+
+def xr_sync_outbounds(xc):
+    """把出站镜像进 Xray 配置。direct 必须排在第一位（Xray 用 outbounds[0] 作默认）"""
+    keep = [o for o in xc.get("outbounds", []) if o.get("tag") in ("direct", "block")]
+    if not any(o.get("tag") == "direct" for o in keep):
+        keep.insert(0, {"tag": "direct", "protocol": "freedom", "settings": {}})
+    if not any(o.get("tag") == "block" for o in keep):
+        keep.append({"tag": "block", "protocol": "blackhole", "settings": {}})
+    keep.sort(key=lambda o: 0 if o.get("tag") == "direct" else 1)
+    mirrored = [x for x in (_sb_ob_to_xray(o) for o in cfg().get("outbounds", [])) if x]
+    xc["outbounds"] = keep + mirrored
+    valid = {o["tag"] for o in xc["outbounds"]}
+    xc.setdefault("routing", {}).setdefault("rules", [])
+    rules = [r for r in xc["routing"]["rules"] if r.get("outboundTag") in valid]
+    # 清孤儿：出站没了之后，只剩挡 QUIC 的 block 规则会白白拖慢节点
+    bound = set()
+    for r in rules:
+        if r.get("outboundTag") not in ("block", "direct"):
+            bound |= set(r.get("inboundTag") or [])
+    kept = []
+    for r in rules:
+        if r.get("outboundTag") == "block":
+            rest = [t for t in (r.get("inboundTag") or []) if t in bound]
+            if not rest:
+                continue
+            r = dict(r, inboundTag=rest)
+        kept.append(r)
+    xc["routing"]["rules"] = kept
+    return xc
+
+
+def xr_resync():
+    """出站增删改后，把 Xray 侧镜像刷新一遍（无 Xray 或无节点时静默跳过）"""
+    if not xr_installed():
+        return True, "ok"
+    xc = xr_sync_outbounds(xcfg())
+    if not xc.get("inbounds"):
+        save_json(XR_CONF, xc)
+        return True, "ok"
+    return apply_xconfig(xc)
+
+
+def xr_set_bind(xc, tag, ob_tag, block_quic=True):
+    """设置 Xray 节点的出站绑定；ob_tag 为空或 direct 表示解绑"""
+    rules = [r for r in xc.get("routing", {}).get("rules", [])
+             if tag not in (r.get("inboundTag") or [])]
+    new = []
+    if ob_tag and ob_tag != "direct":
+        if block_quic:
+            # QUIC 走 SOCKS5 落地常不稳，挡掉 UDP/443 强制回退 TCP（其他 UDP 不受影响）
+            new.append({"type": "field", "inboundTag": [tag],
+                        "network": "udp", "port": "443", "outboundTag": "block"})
+        new.append({"type": "field", "inboundTag": [tag], "outboundTag": ob_tag})
+    xc.setdefault("routing", {})["rules"] = new + rules
+    return xc
+
+
+def xr_binds():
+    """Xray 侧 tag -> 出站名"""
+    out = {}
+    if not xr_installed():
+        return out
+    for r in xcfg().get("routing", {}).get("rules", []):
+        if r.get("outboundTag") in ("block", None):
+            continue
+        for t in (r.get("inboundTag") or []):
+            out[t] = r["outboundTag"]
+    return out
+
+
+def build_xray_inbound(proto, f, tag):
+    """返回 (xray_inbound, share_uri)"""
+    if "xray" not in (PROTOCOLS.get(proto, {}).get("cores") or []):
+        raise ValueError(f"Xray-core 不支持 {proto}")
+    port = int(f["port"])
+    name = f.get("name") or tag
+    cert = f.get("cert", "")
+    cp = kp = domain = ""
+    if cert:
+        domain = cert
+        cp, kp = f"{CERT_DIR}/{domain}/fullchain.pem", f"{CERT_DIR}/{domain}/privkey.pem"
+
+    ib = {"tag": tag, "listen": "::", "port": port,
+          "sniffing": {"enabled": True, "destOverride": ["http", "tls", "quic"]}}
+    ss = {"network": "tcp"}
+    tlsc = {"certificates": [{"certificateFile": cp, "keyFile": kp}]}
+
+    if proto == "vless":
+        priv, pub = gen_reality_x()
+        try:
+            n_sid = max(1, min(8, int(f.get("sid_count", 8))))
+        except (TypeError, ValueError):
+            n_sid = 8
+        sids = [secrets.token_hex(x) for x in [8, 5, 4, 6, 3, 7, 2, 1][:n_sid]]
+        dest, srv = f["dest"], f["server"]
+        use_vision = not f.get("flow", "").startswith("无")
+        cl = {"id": f["uuid"], "email": tag}
+        if use_vision:
+            cl["flow"] = "xtls-rprx-vision"
+        ib["protocol"] = "vless"
+        ib["settings"] = {"clients": [cl], "decryption": "none"}
+        ss["security"] = "reality"
+        # SNI 留空则跟随目标域名；支持逗号分隔多个
+        snis = [x.strip() for x in (f.get("sni") or "").split(",") if x.strip()] or [dest]
+        rs = {"dest": f"{dest}:443", "serverNames": snis,
+              "privateKey": priv, "shortIds": sids}
+        try:
+            xv = int(f.get("xver", 0) or 0)
+        except (TypeError, ValueError):
+            xv = 0
+        if xv:
+            rs["xver"] = xv
+        md = str(f.get("maxdiff", "0")).strip()
+        if md and md != "0":
+            rs["maxTimeDiff"] = _dur_ms(md)
+        for key, fk in (("minClientVer", "min_client"), ("maxClientVer", "max_client")):
+            v = (f.get(fk) or "").strip()
+            if v and re.match(r"^\d+\.\d+\.\d+$", v):
+                rs[key] = v
+        ss["realitySettings"] = rs
+        fp = f.get("utls") or "chrome"
+        spx = (f.get("spiderx") or "/").strip() or "/"
+        uri = (f"vless://{f['uuid']}@{srv}:{port}?encryption=none&security=reality"
+               f"&sni={snis[0]}&fp={fp}&pbk={pub}&sid={sids[0]}&spx={uenc(spx)}&type=tcp"
+               + ("&flow=xtls-rprx-vision" if use_vision else "")
+               + f"#{uenc(name)}")
+
+    elif proto == "vless-tls":
+        ib["protocol"] = "vless"
+        ib["settings"] = {"clients": [{"id": f["uuid"], "email": tag}], "decryption": "none"}
+        ss["security"] = "tls"
+        ss["tlsSettings"] = dict(tlsc, serverName=domain)
+        uri = (f"vless://{f['uuid']}@{domain}:{port}?encryption=none&security=tls"
+               f"&sni={domain}&fp=chrome&type=tcp#{uenc(name)}")
+
+    elif proto == "vmess":
+        ib["protocol"] = "vmess"
+        ib["settings"] = {"clients": [{"id": f["uuid"], "alterId": 0, "email": tag}]}
+        ss["security"] = "tls"
+        ss["tlsSettings"] = dict(tlsc, serverName=domain)
+        vm = {"v": "2", "ps": name, "add": domain, "port": str(port), "id": f["uuid"],
+              "aid": "0", "net": "tcp", "type": "none", "host": domain,
+              "tls": "tls", "sni": domain}
+        uri = "vmess://" + b64(json.dumps(vm, ensure_ascii=False))
+
+    elif proto == "trojan":
+        ib["protocol"] = "trojan"
+        ib["settings"] = {"clients": [{"password": f["password"], "email": tag}]}
+        ss["security"] = "tls"
+        ss["tlsSettings"] = dict(tlsc, serverName=domain)
+        uri = (f"trojan://{uenc(f['password'])}@{domain}:{port}"
+               f"?security=tls&sni={domain}&type=tcp&fp=chrome#{uenc(name)}")
+
+    elif proto == "shadowsocks":
+        method, pw, srv = f["method"], f["password"], f["server"]
+        ib["protocol"] = "shadowsocks"
+        ib["settings"] = {"method": method, "password": pw, "network": "tcp,udp"}
+        uri = f"ss://{b64(method + ':' + pw)}@{srv}:{port}#{uenc(name)}"
+
+    elif proto == "socks":
+        srv = f["server"]
+        ib["protocol"] = "socks"
+        st = {"udp": True}
+        if f.get("user"):
+            st["auth"] = "password"
+            st["accounts"] = [{"user": f["user"], "pass": f["password"]}]
+            uri = f"socks://{b64(f['user'] + ':' + f['password'])}@{srv}:{port}#{uenc(name)}"
+        else:
+            st["auth"] = "noauth"
+            uri = f"socks5://{srv}:{port}#{uenc(name)}"
+        ib["settings"] = st
+
+    elif proto == "http":
+        srv = domain or f["server"]
+        ib["protocol"] = "http"
+        st = {}
+        if f.get("user"):
+            st["accounts"] = [{"user": f["user"], "pass": f["password"]}]
+        ib["settings"] = st
+        if cert:
+            ss["security"] = "tls"
+            ss["tlsSettings"] = dict(tlsc, serverName=domain)
+            scheme = "https"
+        else:
+            scheme = "http"
+        auth = f"{uenc(f['user'])}:{uenc(f['password'])}@" if f.get("user") else ""
+        uri = f"{scheme}://{auth}{srv}:{port}#{uenc(name)}"
+    else:
+        raise ValueError("Xray-core 不支持该协议")
+
+    ib, ss, uri = apply_advanced_x(ib, ss, uri, proto, f)
+    # 嗅探（表单没提交这些键时保持默认全开）
+    if any(k in f for k in ("sniff", "sniff_http", "sniff_tls", "sniff_quic")):
+        if _bl(f, "sniff"):
+            over = [n for n, k in (("http", "sniff_http"), ("tls", "sniff_tls"),
+                                   ("quic", "sniff_quic")) if _bl(f, k)]
+            sn = {"enabled": True, "destOverride": over or ["http", "tls"]}
+            if _bl(f, "sniff_route_only"):
+                sn["routeOnly"] = True
+            ib["sniffing"] = sn
+        else:
+            ib["sniffing"] = {"enabled": False}
+    ib["streamSettings"] = ss
+    return ib, uri
+
+
+# ════════════════════════════════════════════
+# Xray-core：安装 / 配置 / 校验
+# ════════════════════════════════════════════
+XRAY_SKELETON = {
+    "log": {"loglevel": "warning"},
+    "inbounds": [],
+    "outbounds": [{"tag": "direct", "protocol": "freedom", "settings": {}},
+                  {"tag": "block", "protocol": "blackhole", "settings": {}}],
+    "routing": {"domainStrategy": "AsIs", "rules": []},
+}
+
+
+def xr_installed():
+    return os.path.exists(XR_BIN)
+
+
+def xcfg():
+    """读取 Xray 配置，缺失时返回骨架"""
+    c = load_json(XR_CONF, None)
+    if not isinstance(c, dict) or "inbounds" not in c:
+        return json.loads(json.dumps(XRAY_SKELETON))
+    c.setdefault("outbounds", list(XRAY_SKELETON["outbounds"]))
+    c.setdefault("routing", {"domainStrategy": "AsIs", "rules": []})
+    c["routing"].setdefault("rules", [])
+    return c
+
+
+def xr_version():
+    if not xr_installed():
+        return ""
+    c, o, _ = sh(f"{XR_BIN} version")
+    if c == 0 and o:
+        parts = o.splitlines()[0].split()
+        # "Xray 25.3.6 (Xray, Penetrator) ..." -> 25.3.6
+        return parts[1] if len(parts) > 1 else ""
+    return ""
+
+
+def ensure_xray_unit():
+    """写入并启用 xray systemd 单元（幂等）"""
+    unit = f"""[Unit]
+Description=Xray Service (panel)
+Documentation=https://xtls.github.io
+After=network.target nss-lookup.target
+
+[Service]
+Type=simple
+Environment=HOME=/root
+ExecStart={XR_BIN} run -c {XR_CONF}
+Restart=always
+RestartSec=3
+LimitNOFILE=1048576
+NoNewPrivileges=false
+
+[Install]
+WantedBy=multi-user.target
+"""
+    path = "/etc/systemd/system/xray.service"
+    old = ""
+    if os.path.exists(path):
+        with open(path) as fp:
+            old = fp.read()
+    if old.strip() != unit.strip():
+        with open(path, "w") as fp:
+            fp.write(unit)
+        sh("systemctl daemon-reload")
+    sh(f"systemctl enable {XR_SVC} >/dev/null 2>&1")
+
+
+def apply_xconfig(new_cfg):
+    """校验并写入 Xray 配置，失败自动回滚"""
+    if not xr_installed():
+        return False, "Xray-core 未安装，请先到「版本」页安装"
+    ensure_xray_unit()
+    os.makedirs(XR_ETC, exist_ok=True)
+    old = None
+    if os.path.exists(XR_CONF):
+        with open(XR_CONF) as f:
+            old = f.read()
+    save_json(XR_CONF, new_cfg)
+    c, o, e = sh(f"{XR_BIN} run -test -c {XR_CONF}", 25)
+    if c != 0:
+        if old is not None:
+            with open(XR_CONF, "w") as f:
+                f.write(old)
+        return False, f"Xray 配置校验失败:\n{(e or o)[:400]}"
+    # 没有入站时不需要跑服务，停掉省内存
+    if not new_cfg.get("inbounds"):
+        sh(f"systemctl stop {XR_SVC}")
+        return True, "ok"
+    sh(f"systemctl restart {XR_SVC}")
+    time.sleep(1)
+    _, st, _ = sh(f"systemctl is-active {XR_SVC}")
+    if st.strip() != "active":
+        if old is not None:
+            with open(XR_CONF, "w") as f:
+                f.write(old)
+            sh(f"systemctl restart {XR_SVC}")
+        _, log, _ = sh(f"journalctl -u {XR_SVC} -n 15 --no-pager")
+        return False, f"Xray 启动失败已回滚:\n{log[-400:]}"
+    return True, "ok"
+
+
+def xr_fetch_versions(limit=5):
+    c, o, _ = sh("curl -fsSL --max-time 20 "
+                 "'https://api.github.com/repos/XTLS/Xray-core/releases?per_page=10'", 25)
+    if c != 0 or not o:
+        return []
+    try:
+        rel = json.loads(o)
+    except Exception:
+        return []
+    out = []
+    for r in rel:
+        if r.get("draft"):
+            continue
+        out.append({"ver": r.get("tag_name", "").lstrip("v"),
+                    "pre": bool(r.get("prerelease")),
+                    "date": (r.get("published_at") or "")[:10],
+                    "note": (r.get("body") or "").strip()[:300]})
+        if len(out) >= limit:
+            break
+    return out
+
+
+def _xr_asset():
+    return {"amd64": "Xray-linux-64.zip",
+            "arm64": "Xray-linux-arm64-v8a.zip",
+            "armv7": "Xray-linux-arm32-v7a.zip"}.get(get_arch(), "Xray-linux-64.zip")
+
+
+def xr_install_version(ver, job=None):
+    """下载安装指定版本 Xray（zip 用 Python 解，不依赖 unzip）"""
+    def step(t):
+        if job is not None:
+            job["step"] = t
+
+    ver = ver.lstrip("v").strip()
+    if not re.match(r"^[0-9][0-9A-Za-z.\-]*$", ver):
+        return False, "版本号格式无效"
+    asset = _xr_asset()
+    gh = f"https://github.com/XTLS/Xray-core/releases/download/v{ver}/{asset}"
+    mirrors = [gh, f"https://ghfast.top/{gh}", f"https://gh-proxy.com/{gh}"]
+
+    dest_dir = os.path.dirname(XR_BIN)
+    os.makedirs(dest_dir, exist_ok=True)
+    tmp = f"{dest_dir}/.up-{secrets.token_hex(4)}"
+    os.makedirs(tmp, exist_ok=True)
+    zpath = f"{tmp}/x.zip"
+    try:
+        got = False
+        lasterr = ""
+        for i, url in enumerate(mirrors):
+            step(f"下载 Xray ({'官方源' if i == 0 else '镜像 ' + str(i)})")
+            c, o, e = sh(f"curl -fL --max-time 240 --retry 2 -o {zpath} '{url}'", 260)
+            if c == 0 and os.path.exists(zpath) and os.path.getsize(zpath) > 1024 * 1024:
+                got = True
+                break
+            lasterr = (e or o or "下载中断")[:200]
+        if not got:
+            return False, f"下载失败：{lasterr}\n{gh}"
+
+        step("解压")
+        import zipfile
+        binsrc = ""
+        try:
+            with zipfile.ZipFile(zpath) as z:
+                nm = next((n for n in z.namelist()
+                           if n.rstrip("/").split("/")[-1] == "xray"), "")
+                if not nm:
+                    return False, "压缩包内未找到 xray 可执行文件"
+                with z.open(nm) as src, open(f"{tmp}/xray", "wb") as dst:
+                    dst.write(src.read())
+            binsrc = f"{tmp}/xray"
+        except zipfile.BadZipFile:
+            return False, "压缩包损坏，请重试或换镜像"
+        if os.path.getsize(binsrc) < 5 * 1024 * 1024:
+            return False, "解出的文件异常偏小"
+
+        step("安装中")
+        bak = f"{tmp}/xray.prev"
+        had = os.path.exists(XR_BIN)
+        if had:
+            sh(f"cp {XR_BIN} {bak}")
+            sh(f"systemctl stop {XR_SVC}")
+        c, _, e = sh(f"install -m 755 {binsrc} {XR_BIN}")
+        if c != 0:
+            return False, f"安装失败: {e}"
+
+        ensure_xray_unit()
+        os.makedirs(XR_ETC, exist_ok=True)
+        if not os.path.exists(XR_CONF):
+            save_json(XR_CONF, XRAY_SKELETON)
+
+        step("校验配置")
+        c, o, e = sh(f"{XR_BIN} run -test -c {XR_CONF}", 25)
+        if c != 0:
+            if had:
+                sh(f"cp {bak} {XR_BIN}")
+                sh(f"systemctl start {XR_SVC}")
+            return False, f"新版本无法加载当前配置，已回滚:\n{(e or o)[:400]}"
+
+        # 有节点才起服务
+        if xcfg().get("inbounds"):
+            step("启动服务")
+            sh(f"systemctl start {XR_SVC}")
+            time.sleep(1)
+            _, st, _ = sh(f"systemctl is-active {XR_SVC}")
+            if st.strip() != "active":
+                if had:
+                    sh(f"cp {bak} {XR_BIN}")
+                    sh(f"systemctl restart {XR_SVC}")
+                _, log, _ = sh(f"journalctl -u {XR_SVC} -n 15 --no-pager")
+                return False, f"启动失败，已回滚:\n{log[-400:]}"
+        return True, xr_version()
+    finally:
+        sh(f"rm -rf {tmp}")
+
+
+XVER_JOB = {"running": False, "ver": "", "ok": None, "msg": "", "step": ""}
+
+
+def xr_install_async(ver):
+    if XVER_JOB["running"]:
+        return False, "已有安装任务在进行"
+
+    def run():
+        XVER_JOB.update(running=True, ver=ver, ok=None, msg="", step="准备中")
+        try:
+            okk, msg = xr_install_version(ver, XVER_JOB)
+            XVER_JOB.update(ok=okk, msg=str(msg))
+        except Exception as e:
+            XVER_JOB.update(ok=False, msg=f"异常: {e}")
+        finally:
+            XVER_JOB.update(running=False, step="")
+    threading.Thread(target=run, daemon=True).start()
+    return True, "已开始"
+
+
+def core_of(tag, m=None):
+    """节点属于哪个核心"""
+    m = m if m is not None else meta()
+    return (m.get(tag) or {}).get("core") or DEFAULT_CORE
+
+
+def used_ports():
+    """两个核心已占用的端口（跨核心冲突检测用）"""
+    used = set()
+    for i in cfg().get("inbounds", []):
+        if i.get("listen_port"):
+            used.add(int(i["listen_port"]))
+    if xr_installed():
+        for i in xcfg().get("inbounds", []):
+            if i.get("port"):
+                try:
+                    used.add(int(i["port"]))
+                except (TypeError, ValueError):
+                    pass
+    return used
+
+
+def all_tags():
+    tags = {i.get("tag") for i in cfg().get("inbounds", [])}
+    if xr_installed():
+        tags |= {i.get("tag") for i in xcfg().get("inbounds", [])}
+    return tags | set(meta().keys())
+
+
 def uenc(s):
     return urllib.parse.quote(str(s), safe="")
 
@@ -820,6 +1447,113 @@ TRANSPORTS = [
      "h": "首包塞进握手，省一个 RTT（仅 WebSocket 生效）"},
 ]
 
+# ── 表单分组（对齐 3x-ui 的标签页）──
+G_BASE, G_PROTO, G_TRANS = "基础配置", "协议", "传输"
+G_SEC, G_SNIFF, G_ADV = "安全", "嗅探", "高级配置"
+
+_FIELD_GROUP = {
+    # 基础
+    "name": G_BASE, "port": G_BASE, "server": G_BASE, "hop": G_BASE,
+    # 协议
+    "uuid": G_PROTO, "password": G_PROTO, "method": G_PROTO, "user": G_PROTO,
+    "authstr": G_PROTO, "psk": G_PROTO, "sspass": G_PROTO, "flow": G_PROTO,
+    "cc": G_PROTO, "zrtt": G_PROTO, "up": G_PROTO, "down": G_PROTO,
+    # 安全
+    "cert": G_SEC, "dest": G_SEC, "sni": G_SEC, "regen": G_SEC,
+    "sid_count": G_SEC, "maxdiff": G_SEC, "utls": G_SEC, "xver": G_SEC,
+    "min_client": G_SEC, "max_client": G_SEC, "spiderx": G_SEC,
+    "tls_min": G_SEC, "alpn": G_SEC, "obfs": G_SEC,
+    "masq_type": G_SEC, "masq": G_SEC,
+    # 传输
+    "transport": G_TRANS, "tr_path": G_TRANS, "tr_host": G_TRANS,
+    "tr_ed": G_TRANS, "kcp_seed": G_TRANS, "kcp_header": G_TRANS,
+    # 嗅探
+    "sniff": G_SNIFF, "sniff_http": G_SNIFF, "sniff_tls": G_SNIFF,
+    "sniff_quic": G_SNIFF, "sniff_route_only": G_SNIFF, "sniff_note": G_SNIFF,
+    # 其余（tfo/mptcp/udp*/mux*）归高级
+}
+
+# ── Xray 嗅探设置（3x-ui 的「嗅探」页）──
+XADV_SNIFF = [
+    {"k": "sniff", "l": "启用嗅探", "t": "bool", "d": "1",
+     "h": "识别流量真实域名，路由规则和日志才能按域名匹配。关掉只能按 IP 走"},
+    {"k": "sniff_http", "l": "识别 HTTP", "t": "bool", "d": "1"},
+    {"k": "sniff_tls", "l": "识别 TLS", "t": "bool", "d": "1"},
+    {"k": "sniff_quic", "l": "识别 QUIC", "t": "bool", "d": "1"},
+    {"k": "sniff_route_only", "l": "仅用于路由", "t": "bool", "d": "0",
+     "h": "只拿嗅探结果做路由判断，不改写真实目标地址。走 CDN 回源时打开"},
+]
+_SB_SNIFF_NOTE = [
+    {"k": "sniff_note", "t": "note",
+     "l": "sing-box 1.11 起嗅探改为全局路由动作，不再按节点单独配置。"
+          "当前配置里已有一条 sniff 规则对所有入站生效，无需在这里设置。"},
+]
+
+# 每个协议可用的核心
+_CORE_MAP = {'vless': ['sing-box', 'xray'], 'vless-tls': ['sing-box', 'xray'], 'vmess': ['sing-box', 'xray'], 'trojan': ['sing-box', 'xray'], 'shadowsocks': ['sing-box', 'xray'], 'socks': ['sing-box', 'xray'], 'http': ['sing-box', 'xray'], 'hysteria2': ['sing-box'], 'hysteria': ['sing-box'], 'tuic': ['sing-box'], 'anytls': ['sing-box'], 'shadowtls': ['sing-box'], 'naive': ['sing-box'], 'snell': ['sing-box'], 'mixed': ['sing-box']}
+for _p, _c in _CORE_MAP.items():
+    PROTOCOLS[_p]["cores"] = _c
+
+# ── Xray 专用高级选项（字段名与 sing-box 侧保持一致，写入时映射到 Xray schema）──
+XADV_SOCK = [
+    {"k": "tfo", "l": "TCP Fast Open", "t": "bool", "d": "0",
+     "h": "首包随握手一起发，省一个 RTT。中间设备可能丢弃，连不上就关掉"},
+    {"k": "mptcp", "l": "TCP Multi Path", "t": "bool", "d": "0",
+     "h": "多路径 TCP，客户端也要开才生效"},
+]
+XADV_TLS = [
+    {"k": "tls_min", "l": "TLS 最低版本", "t": "select", "opts": ["1.3", "1.2"], "d": "1.3",
+     "h": "1.3 更快更隐蔽；只有老客户端连不上时才降到 1.2"},
+    {"k": "alpn", "l": "ALPN", "t": "select",
+     "opts": ["不设置", "h2,http/1.1", "h2", "http/1.1"], "d": "不设置",
+     "h": "改动后客户端需重新拉订阅，不确定就保持不设置"},
+]
+XTRANSPORTS = [
+    {"k": "transport", "l": "传输层", "t": "select",
+     "opts": ["TCP (原始，最快)", "WebSocket", "gRPC", "HTTPUpgrade",
+              "XHTTP (Xray 专属，过 CDN 最好)", "mKCP (Xray 专属，抗丢包)"],
+     "d": "TCP (原始，最快)",
+     "h": "XHTTP 与 mKCP 是 Xray 独有；mKCP 用带宽换丢包恢复，适合线路差但别开在没必要的地方"},
+    {"k": "tr_path", "l": "路径 / 服务名", "t": "text", "d": "/",
+     "h": "WS / HTTPUpgrade / XHTTP 填路径；gRPC 填 serviceName"},
+    {"k": "tr_host", "l": "Host 伪装", "t": "text", "d": "",
+     "h": "留空则用证书域名。套 CDN 时填回源域名"},
+    {"k": "kcp_seed", "l": "mKCP 混淆密码", "t": "text", "d": "",
+     "h": "仅 mKCP 生效，两端必须一致。留空则不混淆"},
+    {"k": "kcp_header", "l": "mKCP 伪装类型", "t": "select",
+     "opts": ["none", "srtp", "utp", "wechat-video", "dtls", "wireguard"], "d": "none",
+     "h": "仅 mKCP 生效，把流量伪装成视频通话 / BT 等"},
+]
+
+XADV_REALITY = [
+    {"k": "sni", "l": "SNI (留空=用目标域名)", "t": "text", "d": "",
+     "h": "客户端握手时用的域名，通常与目标一致。多个用逗号分隔"},
+    {"k": "utls", "l": "uTLS 指纹", "t": "select",
+     "opts": ["chrome", "firefox", "safari", "ios", "edge", "android", "random"],
+     "d": "chrome", "h": "客户端伪装成哪种浏览器的 TLS 指纹，写进分享链接"},
+    {"k": "xver", "l": "Xver (PROXY protocol)", "t": "select",
+     "opts": ["0", "1", "2"], "d": "0",
+     "h": "回落到本机其他服务时才用，0 = 关闭。不确定就保持 0"},
+    {"k": "min_client", "l": "最小客户端版本", "t": "text", "d": "1.0.0",
+     "h": "低于此版本的 Xray 客户端会被拒绝。1.0.0 等于不限制"},
+    {"k": "max_client", "l": "最大客户端版本", "t": "text", "d": "",
+     "h": "留空 = 不限制。格式 x.y.z"},
+    {"k": "spiderx", "l": "SpiderX", "t": "text", "d": "/",
+     "h": "客户端爬取目标站的起始路径，写进分享链接"},
+]
+
+_XADV_MAP = {
+    "vless":       XADV_REALITY + XADV_SOCK,
+    "vless-tls":   XADV_SOCK + XADV_TLS + XTRANSPORTS,
+    "vmess":       XADV_SOCK + XADV_TLS + XTRANSPORTS,
+    "trojan":      XADV_SOCK + XADV_TLS + XTRANSPORTS,
+    "shadowsocks": XADV_SOCK,
+    "socks":       XADV_SOCK,
+    "http":        XADV_SOCK,
+}
+for _p, _a in _XADV_MAP.items():
+    PROTOCOLS[_p]["adv_xray"] = _a + XADV_SNIFF
+
 _ADV_MAP = {
     "hysteria2":   ADV_UDP,
     "hysteria":    ADV_UDP,
@@ -838,7 +1572,14 @@ _ADV_MAP = {
     "shadowsocks": ADV_TCP + ADV_UDP + ADV_MUX,
 }
 for _p, _a in _ADV_MAP.items():
-    PROTOCOLS[_p]["adv"] = _a
+    PROTOCOLS[_p]["adv"] = _a + _SB_SNIFF_NOTE
+
+
+# 给所有字段打上分组标签（未列出的一律归「高级配置」）
+for _spec in PROTOCOLS.values():
+    for _key in ("fields", "adv", "adv_xray"):
+        for _f in (_spec.get(_key) or []):
+            _f.setdefault("g", _FIELD_GROUP.get(_f["k"], G_ADV))
 
 
 def _bl(f, k):
@@ -1419,9 +2160,21 @@ def api_status():
     ver = ver.splitlines()[0].split()[-1] if ver else "未知"
     _, act, _ = sh("systemctl is-active sing-box")
     c = cfg()
+    n_sb = len(c.get("inbounds", []))
+    xi = xr_installed()
+    n_xr = 0
+    xrun = False
+    xver = ""
+    if xi:
+        n_xr = len(xcfg().get("inbounds", []))
+        xver = xr_version()
+        _, xact, _ = sh(f"systemctl is-active {XR_SVC}")
+        xrun = xact.strip() == "active"
     return {"version": ver, "running": act.strip() == "active",
             "ip": public_ip(),
-            "inbounds": len(c.get("inbounds", [])),
+            "inbounds": n_sb + n_xr,
+            "xray_installed": xi, "xray_version": xver,
+            "xray_running": xrun, "xray_nodes": n_xr, "sb_nodes": n_sb,
             "outbounds": len([o for o in c.get("outbounds", []) if o.get("type") != "direct"])}
 
 
@@ -1430,14 +2183,25 @@ def api_inbounds():
     out = []
     binds = {}
     for r in c.get("route", {}).get("rules", []):
+        ob = r.get("outbound")
+        if not ob:
+            continue
         for t in (r.get("inbound") or []):
-            binds[t] = r.get("outbound")
+            binds[t] = ob
     for ib in c.get("inbounds", []):
         t = ib.get("tag")
         info = m.get(t, {})
         out.append({"tag": t, "type": ib.get("type"), "port": ib.get("listen_port"),
                     "name": info.get("name", t), "uri": info.get("uri", ""),
-                    "bind": binds.get(t, "direct")})
+                    "core": "sing-box", "bind": binds.get(t, "direct")})
+    if xr_installed():
+        xb = xr_binds()
+        for ib in xcfg().get("inbounds", []):
+            t = ib.get("tag")
+            info = m.get(t, {})
+            out.append({"tag": t, "type": ib.get("protocol"), "port": ib.get("port"),
+                        "name": info.get("name", t), "uri": info.get("uri", ""),
+                        "core": "xray", "bind": xb.get(t, "direct")})
     return out
 
 
@@ -1457,32 +2221,55 @@ def api_add_inbound(body):
     proto = body.get("proto")
     if proto not in PROTOCOLS:
         return False, "未知协议"
-    f = body.get("fields", {})
+    core = body.get("core") or DEFAULT_CORE
     spec = PROTOCOLS[proto]
+    if core not in (spec.get("cores") or [DEFAULT_CORE]):
+        return False, f"{spec['label']} 不支持用 {core} 运行"
+    if core == "xray" and not xr_installed():
+        return False, "Xray-core 未安装，请先到「版本」页安装"
+    f = body.get("fields", {})
     if spec["needs_cert"]:
         d = f.get("cert", "")
         if not d or not os.path.exists(f"{CERT_DIR}/{d}/fullchain.pem"):
             return False, "请先选择或申请有效证书"
-    c = cfg()
-    base = f"{proto}-in"
+    # 跨核心端口冲突检查（两个核心不能抢同一端口）
+    try:
+        port = int(f.get("port"))
+    except (TypeError, ValueError):
+        return False, "端口无效"
+    if port in used_ports():
+        return False, f"端口 {port} 已被另一个节点占用（两个核心共用同一端口空间）"
+
+    base = f"{proto}-{'x' if core == 'xray' else 'in'}"
     tag, n = base, 1
-    exist = {i.get("tag") for i in c.get("inbounds", [])}
+    exist = all_tags()
     while tag in exist:
         tag = f"{base}-{n}"; n += 1
+
     try:
-        ib, uri = build_inbound(proto, f, tag)
+        if core == "xray":
+            ib, uri = build_xray_inbound(proto, f, tag)
+        else:
+            ib, uri = build_inbound(proto, f, tag)
     except Exception as e:
         return False, f"生成失败: {e}"
-    # ShadowTLS 需要配套的内部入站
-    extra = ib.pop("_extra_inbound", None)
-    c.setdefault("inbounds", []).append(ib)
-    if extra:
-        c["inbounds"].append(extra)
-    okk, msg = apply_config(c)
+
+    if core == "xray":
+        xc = xr_sync_outbounds(xcfg())
+        xc.setdefault("inbounds", []).append(ib)
+        okk, msg = apply_xconfig(xc)
+    else:
+        c = cfg()
+        extra = ib.pop("_extra_inbound", None)   # ShadowTLS 配套内部入站
+        c.setdefault("inbounds", []).append(ib)
+        if extra:
+            c["inbounds"].append(extra)
+        okk, msg = apply_config(c)
     if not okk:
         return False, msg
+
     m = meta()
-    m[tag] = {"name": f.get("name", tag), "uri": uri, "proto": proto,
+    m[tag] = {"name": f.get("name", tag), "uri": uri, "proto": proto, "core": core,
               "fields": f, "created": time.strftime("%F %T")}
     save_json(META_FILE, m)
     rebuild_sub()
@@ -1620,6 +2407,85 @@ def inbound_to_fields(ib, proto, info):
     return f
 
 
+def xinbound_to_fields(ib, proto, info):
+    """从 Xray inbound 反推表单字段（手工改过配置或 meta 丢失时兜底）"""
+    ss = ib.get("streamSettings") or {}
+    st = ib.get("settings") or {}
+    cls = (st.get("clients") or [{}])
+    c0 = cls[0] if cls else {}
+    tls = ss.get("tlsSettings") or {}
+    rs = ss.get("realitySettings") or {}
+    f = {"name": info.get("name") or ib.get("tag", ""),
+         "port": str(ib.get("port", ""))}
+    cert = _cert_domain((tls.get("certificates") or [{}])[0].get("certificateFile", ""))
+    if cert:
+        f["cert"] = cert
+    srv = ""
+    m = re.search(r"@([^:/?#]+):", info.get("uri", ""))
+    if m:
+        srv = m.group(1)
+    f["server"] = srv or cert or public_ip()
+
+    if proto == "vless":
+        f["uuid"] = c0.get("id", "")
+        f["dest"] = (rs.get("dest") or "").rsplit(":", 1)[0]
+        f["sni"] = ",".join(rs.get("serverNames") or [])
+        f["flow"] = "xtls-rprx-vision (推荐，性能最好)" if c0.get("flow") else "无"
+        f["regen"] = "保持现有密钥（编辑时推荐）"
+        f["sid_count"] = str(len(rs.get("shortIds") or [])) or "8"
+        md = rs.get("maxTimeDiff") or 0
+        f["maxdiff"] = {0: "0", 60000: "1m", 300000: "5m", 3600000: "1h"}.get(md, "0")
+        f["xver"] = str(rs.get("xver", 0) or 0)
+        f["min_client"] = rs.get("minClientVer", "1.0.0") or "1.0.0"
+        f["max_client"] = rs.get("maxClientVer", "") or ""
+        mfp = re.search(r"[?&]fp=([^&#]+)", info.get("uri", ""))
+        msx = re.search(r"[?&]spx=([^&#]+)", info.get("uri", ""))
+        f["utls"] = mfp.group(1) if mfp else "chrome"
+        f["spiderx"] = urllib.parse.unquote(msx.group(1)) if msx else "/"
+    elif proto in ("vless-tls", "vmess"):
+        f["uuid"] = c0.get("id", "")
+    elif proto == "trojan":
+        f["password"] = c0.get("password", "")
+    elif proto == "shadowsocks":
+        f["method"] = st.get("method", "2022-blake3-aes-128-gcm")
+        f["password"] = st.get("password", "")
+    elif proto in ("socks", "http"):
+        acc = (st.get("accounts") or [{}])[0]
+        f["user"] = acc.get("user", "")
+        f["password"] = acc.get("pass", "")
+
+    sn = ib.get("sniffing") or {}
+    over = set(sn.get("destOverride") or [])
+    f["sniff"] = "1" if sn.get("enabled") else "0"
+    for n, k in (("http", "sniff_http"), ("tls", "sniff_tls"), ("quic", "sniff_quic")):
+        f[k] = "1" if n in over else "0"
+    f["sniff_route_only"] = "1" if sn.get("routeOnly") else "0"
+
+    keys = {a["k"] for a in (PROTOCOLS.get(proto, {}).get("adv_xray") or [])}
+    sock = ss.get("sockopt") or {}
+    if "tfo" in keys:
+        f["tfo"] = "1" if sock.get("tcpFastOpen") else "0"
+        f["mptcp"] = "1" if sock.get("tcpMptcp") else "0"
+    if "tls_min" in keys:
+        f["tls_min"] = tls.get("minVersion") or "1.3"
+        al = tls.get("alpn")
+        f["alpn"] = ",".join(al) if al else "不设置"
+    if "transport" in keys:
+        net = ss.get("network", "tcp")
+        f["transport"] = {"ws": "WebSocket", "grpc": "gRPC",
+                          "httpupgrade": "HTTPUpgrade",
+                          "xhttp": "XHTTP (Xray 专属，过 CDN 最好)",
+                          "kcp": "mKCP (Xray 专属，抗丢包)"}.get(net, "TCP (原始，最快)")
+        cf = (ss.get("wsSettings") or ss.get("httpupgradeSettings")
+              or ss.get("xhttpSettings") or {})
+        f["tr_path"] = (ss.get("grpcSettings") or {}).get("serviceName") or cf.get("path") or "/"
+        f["tr_host"] = cf.get("host") or ""
+        k = ss.get("kcpSettings") or {}
+        f["kcp_seed"] = k.get("seed", "")
+        f["kcp_header"] = (k.get("header") or {}).get("type", "none")
+    return f
+
+
 def guess_proto(ib):
     """无记录时从配置判断协议种类"""
     t = ib.get("type")
@@ -1629,13 +2495,64 @@ def guess_proto(ib):
     return t if t in PROTOCOLS else ""
 
 
+def _edit_xray_inbound(tag, body, m, info):
+    xc = xr_sync_outbounds(xcfg())
+    old = next((i for i in xc.get("inbounds", []) if i.get("tag") == tag), None)
+    if not old:
+        return False, "节点不存在"
+    proto = body.get("proto") or info.get("proto")
+    if proto not in PROTOCOLS:
+        return False, "未知协议"
+    f = body.get("fields", {})
+    if PROTOCOLS[proto]["needs_cert"]:
+        d = f.get("cert", "")
+        if d and not os.path.exists(f"{CERT_DIR}/{d}/fullchain.pem"):
+            return False, "所选证书不存在"
+    try:
+        newport = int(f.get("port"))
+    except (TypeError, ValueError):
+        return False, "端口无效"
+    if newport != old.get("port") and newport in used_ports():
+        return False, f"端口 {newport} 已被另一个节点占用"
+    try:
+        ib, uri = build_xray_inbound(proto, f, tag)
+    except Exception as e:
+        return False, f"生成失败: {e}"
+    # Reality：默认沿用原密钥，选了「重新生成」或 dest 变了才换
+    if proto == "vless":
+        oss, nss = (old.get("streamSettings") or {}), (ib.get("streamSettings") or {})
+        oldr, newr = (oss.get("realitySettings") or {}), (nss.get("realitySettings") or {})
+        same_dest = oldr.get("dest") == newr.get("dest")
+        if same_dest and oldr.get("privateKey") and not str(f.get("regen", "")).startswith("重新生成"):
+            newr["privateKey"] = oldr["privateKey"]
+            newr["shortIds"] = oldr.get("shortIds", newr.get("shortIds"))
+            oldpub = re.search(r"pbk=([^&#]+)", info.get("uri", ""))
+            oldsid = re.search(r"sid=([^&#]+)", info.get("uri", ""))
+            if oldpub:
+                uri = re.sub(r"pbk=[^&#]+", f"pbk={oldpub.group(1)}", uri)
+            if oldsid:
+                uri = re.sub(r"sid=[^&#]+", f"sid={oldsid.group(1)}", uri)
+    xc["inbounds"] = [ib if i.get("tag") == tag else i for i in xc.get("inbounds", [])]
+    okk, msg = apply_xconfig(xc)
+    if not okk:
+        return False, msg
+    info.update({"name": f.get("name", tag), "uri": uri, "proto": proto, "core": "xray",
+                 "fields": f, "edited": time.strftime("%F %T")})
+    m[tag] = info
+    save_json(META_FILE, m)
+    rebuild_sub()
+    return True, {"tag": tag, "uri": uri}
+
+
 def api_edit_inbound(tag, body):
+    m = meta()
+    info = m.get(tag, {})
+    if core_of(tag, m) == "xray":
+        return _edit_xray_inbound(tag, body, m, info)
     c = cfg()
     old = next((i for i in c.get("inbounds", []) if i.get("tag") == tag), None)
     if not old:
         return False, "节点不存在"
-    m = meta()
-    info = m.get(tag, {})
     proto = body.get("proto") or info.get("proto")
     if proto not in PROTOCOLS:
         return False, "未知协议"
@@ -1691,6 +2608,19 @@ def api_edit_inbound(tag, body):
 
 
 def api_del_inbound(tag):
+    m0 = meta()
+    if core_of(tag, m0) == "xray":
+        xc = xr_sync_outbounds(xcfg())
+        xc["inbounds"] = [i for i in xc.get("inbounds", []) if i.get("tag") != tag]
+        xc["routing"]["rules"] = [r for r in xc.get("routing", {}).get("rules", [])
+                                  if tag not in (r.get("inboundTag") or [])]
+        okk, msg = apply_xconfig(xc)
+        if not okk:
+            return False, msg
+        m0.pop(tag, None)
+        save_json(META_FILE, m0)
+        rebuild_sub()
+        return True, "已删除"
     c = cfg()
     # ShadowTLS 的配套内部入站一并删除
     drop = {tag, f"{tag}-ss"}
@@ -1759,6 +2689,7 @@ def api_add_outbound(body):
     c.setdefault("outbounds", []).append(ob)
 
     # 同时绑定所选节点（合并到一次写入，避免多次重启）
+    xr_binds_sel = [b for b in binds if core_of(b) == "xray"]
     if binds:
         valid = {i.get("tag") for i in c.get("inbounds", [])}
         binds = [b for b in binds if b in valid]
@@ -1789,7 +2720,17 @@ def api_add_outbound(body):
         c["route"]["rules"] = head + new_rules + tail
 
     okk, msg = apply_config(c)
-    return (True, {"tag": tag, "bound": len(binds)}) if okk else (False, msg)
+    if not okk:
+        return False, msg
+    # Xray 侧节点的绑定：镜像出站后写 routing 规则
+    if xr_binds_sel and xr_installed():
+        xc = xr_sync_outbounds(xcfg())
+        for b in xr_binds_sel:
+            xc = xr_set_bind(xc, b, tag, body.get("block_quic", True))
+        okx, msgx = apply_xconfig(xc)
+        if not okx:
+            return False, f"sing-box 侧已保存，但 Xray 侧绑定失败：{msgx}"
+    return True, {"tag": tag, "bound": len(binds) + len(xr_binds_sel)}
 
 
 def api_edit_outbound(tag, body):
@@ -1813,7 +2754,17 @@ def api_edit_outbound(tag, body):
             c["route"]["final"] = newtag
 
     okk, msg = apply_config(c)
-    return (True, {"tag": newtag}) if okk else (False, msg)
+    if not okk:
+        return False, msg
+    # Xray 侧同步改名（镜像重建 + 绑定跟着新名字走）
+    if xr_installed() and newtag != tag:
+        xc = xcfg()
+        for r in xc.get("routing", {}).get("rules", []):
+            if r.get("outboundTag") == tag:
+                r["outboundTag"] = newtag
+        save_json(XR_CONF, xc)
+    xr_resync()
+    return True, {"tag": newtag}
 
 
 def api_del_outbound(tag):
@@ -1839,10 +2790,23 @@ def api_del_outbound(tag):
     if c.get("route", {}).get("final") == tag:
         c["route"]["final"] = "direct"
     okk, msg = apply_config(c)
-    return (True, "已删除") if okk else (False, msg)
+    if not okk:
+        return False, msg
+    xr_resync()
+    return True, "已删除"
 
 
 def api_bind(inbound, outbound):
+    if core_of(inbound) == "xray":
+        if not xr_installed():
+            return False, "Xray-core 未安装"
+        xc = xr_sync_outbounds(xcfg())
+        if outbound and outbound != "direct" and \
+           not any(o.get("tag") == outbound for o in xc.get("outbounds", [])):
+            return False, f"出站 {outbound} 不存在或类型不被 Xray 支持（仅 SOCKS5 / HTTP）"
+        xc = xr_set_bind(xc, inbound, outbound)
+        okk, msg = apply_xconfig(xc)
+        return (True, "已更新") if okk else (False, msg)
     c = cfg()
     rules = c.get("route", {}).get("rules", [{"action": "sniff"}])
     cleaned = []
@@ -1989,6 +2953,8 @@ h1{font-size:16px;font-weight:650;letter-spacing:.2px;white-space:nowrap}
  display:flex;align-items:center;gap:8px;flex-wrap:wrap}
 .badge{font-size:10.5px;padding:2px 8px;border-radius:20px;background:var(--bg2);
  color:var(--tx2);font-weight:500;border:1px solid var(--line)}
+.badge.bs{background:rgba(59,130,246,.12);color:#8ab4f8;border-color:rgba(59,130,246,.3)}
+.badge.bx{background:rgba(251,191,36,.12);color:#f5c563;border-color:rgba(251,191,36,.3)}
 .row{display:flex;justify-content:space-between;align-items:center;gap:12px;
  padding:7px 0;font-size:13px;border-bottom:1px solid var(--line)}
 .row:last-of-type{border:0}
@@ -2030,6 +2996,25 @@ select{cursor:pointer}
 .chk em{color:var(--warn);font-style:normal;font-size:11px;margin-left:7px}
 .chkbox{background:#0a0c10;border:1px solid var(--line2);border-radius:var(--r2);
  padding:5px;max-height:220px;overflow:auto}
+.ftabs{display:flex;gap:2px;margin:16px 0 4px;border-bottom:1px solid var(--line);
+ overflow-x:auto;scrollbar-width:none}
+.ftabs::-webkit-scrollbar{display:none}
+.ftab{padding:8px 13px;cursor:pointer;color:var(--tx2);font-size:13px;font-weight:500;
+ white-space:nowrap;border-bottom:2px solid transparent;margin-bottom:-1px;transition:.15s;
+ user-select:none;display:flex;align-items:center;gap:5px}
+.ftab:hover{color:var(--tx)}
+.ftab.active{color:var(--pri);border-bottom-color:var(--pri)}
+.ftab b{font-size:10px;font-weight:600;background:var(--card2);color:var(--tx3);
+ padding:1px 5px;border-radius:9px}
+.ftab.active b{background:rgba(59,130,246,.16);color:var(--pri)}
+.fpane[hidden]{display:none}
+.fpane>label:first-child{margin-top:6px}
+.segs{display:flex;gap:4px;background:var(--bg2);padding:4px;border-radius:var(--r2);margin-top:5px}
+.seg{flex:1;text-align:center;padding:8px 10px;border-radius:7px;cursor:pointer;
+ font-size:13.5px;font-weight:500;color:var(--tx2);transition:.15s;user-select:none}
+.seg:hover{color:var(--tx)}
+.seg.active{background:var(--card2);color:#fff;box-shadow:0 1px 2px rgba(0,0,0,.3)}
+.seg.dis{opacity:.4;cursor:not-allowed}
 details{border:1px solid var(--line);border-radius:var(--r2);margin-top:14px;
  background:var(--bg2);overflow:hidden}
 details[open]{border-color:var(--line2)}
@@ -2093,7 +3078,10 @@ pre{background:#0a0c10;padding:12px;border-radius:var(--r2);overflow:auto;
 </style></head><body>
 <div id="login" class="wrap login" style="display:none">
   <div class="card"><h3>sing-box 面板</h3>
-    <label>密码</label><input type="password" id="pw" onkeydown="if(event.key==='Enter')doLogin()">
+    <label>用户名</label><input type="text" id="usr" autocomplete="username"
+      onkeydown="if(event.key==='Enter')document.getElementById('pw').focus()">
+    <label>密码</label><input type="password" id="pw" autocomplete="current-password"
+      onkeydown="if(event.key==='Enter')doLogin()">
     <div class="acts"><button onclick="doLogin()">登录</button></div>
   </div>
 </div>
@@ -2121,18 +3109,26 @@ pre{background:#0a0c10;padding:12px;border-radius:var(--r2);overflow:auto;
  <div class="uri" id="suburl" onclick="cp(this.textContent)"></div>
  <div id="subinfo" style="margin-top:12px"></div></div></div>
 <div id="v-ver" style="display:none"><div id="verbox"></div></div>
-<div id="v-log" style="display:none"><div class="card"><div class="acts" style="margin-bottom:10px"><button class="btn2" onclick="loadLog()">刷新</button></div><pre id="logbox"></pre></div></div>
+<div id="v-log" style="display:none"><div class="card">
+ <div class="segs" style="margin-bottom:12px">
+  <div class="seg active" data-l="sing-box" onclick="pickLog('sing-box')">sing-box 日志</div>
+  <div class="seg" data-l="xray" onclick="pickLog('xray')">Xray 日志</div>
+ </div>
+ <div class="acts" style="margin-bottom:10px"><button class="btn2" onclick="loadLog()">刷新</button></div>
+ <pre id="logbox"></pre></div></div>
 </div></div>
 <div class="modal" id="modal"><div class="mbox" id="mbox"></div></div>
 <div class="toast" id="toast"></div>
 <script>
 const BASE='__BASE__';
-let TK=localStorage.getItem('tk')||'',PROTOS={},CERTS=[],OUTS=[];
+let TK=localStorage.getItem('tk')||'',PROTOS={},CERTS=[],OUTS=[],ST={},LOGCORE='sing-box';
 function msg(t,ok){const e=document.getElementById('toast');e.textContent=t;e.className='toast show '+(ok?'ok':'err');setTimeout(()=>e.className='toast',3500)}
 async function api(p,m,b){const r=await fetch(BASE+'/api'+p,{method:m||'GET',headers:{'Content-Type':'application/json','X-Token':TK},body:b?JSON.stringify(b):null});
  if(r.status===401){TK='';localStorage.removeItem('tk');show(0);throw new Error('未登录')}return r.json()}
 function show(in_){document.getElementById('login').style.display=in_?'none':'block';document.getElementById('app').style.display=in_?'block':'none';if(in_)refresh()}
-async function doLogin(){const pw=document.getElementById('pw').value;const r=await(await fetch(BASE+'/api/login',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({password:pw})})).json();
+async function doLogin(){const pw=document.getElementById('pw').value;
+ const us=document.getElementById('usr').value;
+ const r=await(await fetch(BASE+'/api/login',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({username:us,password:pw})})).json();
  if(r.ok){TK=r.token;localStorage.setItem('tk',TK);show(1)}else msg('密码错误')}
 function logout(){TK='';localStorage.removeItem('tk');show(0)}
 function tab(t){document.querySelectorAll('.tab').forEach(e=>e.classList.toggle('active',e.dataset.t===t));
@@ -2141,10 +3137,12 @@ function tab(t){document.querySelectorAll('.tab').forEach(e=>e.classList.toggle(
 function closeM(){document.getElementById('modal').classList.remove('show')}
 function cp(t){navigator.clipboard.writeText(t).then(()=>msg('已复制',1))}
 async function refresh(){const s=await api('/status');
- document.getElementById('stat').innerHTML=`<span><span class="dot ${s.running?'on':'off'}"></span>${s.running?'运行中':'已停止'}</span><span>版本 <b>${s.version}</b></span><span>IP <b>${s.ip}</b></span><span>节点 <b>${s.inbounds}</b></span><span>出站 <b>${s.outbounds}</b></span>`;
+ ST=s;
+ const xr=s.xray_installed?`<span><span class="dot ${s.xray_running?'on':'off'}"></span>Xray <b>${s.xray_version||'?'}</b> · ${s.xray_nodes} 节点</span>`:'';
+ document.getElementById('stat').innerHTML=`<span><span class="dot ${s.running?'on':'off'}"></span>sing-box <b>${s.version}</b> · ${s.sb_nodes} 节点</span>${xr}<span>IP <b>${s.ip}</b></span><span>出站 <b>${s.outbounds}</b></span>`;
  PROTOS=await api('/protocols');loadIn();loadOut()}
 async function loadIn(){const l=await api('/inbounds');OUTS=await api('/outbounds');
- document.getElementById('inlist').innerHTML=l.length?l.map(n=>`<div class="card"><h3>${esc(n.name)}<span class="badge">${n.type}</span></h3>
+ document.getElementById('inlist').innerHTML=l.length?l.map(n=>`<div class="card"><h3>${esc(n.name)}<span class="badge">${n.type}</span><span class="badge ${n.core==='xray'?'bx':'bs'}">${n.core==='xray'?'Xray':'sing-box'}</span></h3>
   <div class="row"><span>标签</span><span>${n.tag}</span></div>
   <div class="row"><span>端口</span><span>${n.port}</span></div>
   <div class="row"><span>出站</span><span>${n.bind==='direct'?'直连':esc(n.bind)}</span></div>
@@ -2223,6 +3221,52 @@ async function loadSub(){let r;
    <button class="btn2" onclick="subTokenDlg()">更换订阅地址</button></div>`;
  h+=`<p style="color:#8b93a1;font-size:12px;margin-top:10px">点击链接可复制 · token 即密码，勿外泄</p>`;
  document.getElementById('subinfo').innerHTML=h}
+async function xrayCard(){
+ const r=await api('/xray-versions').catch(()=>null);
+ if(!r)return '';
+ if(!r.installed){
+  return `<div class="card"><h3>Xray-core <span class="badge bx">未安装</span></h3>
+   <p style="color:#8b93a1;font-size:12.5px;line-height:1.7">
+   装上之后创建节点可以选择由 Xray 运行。它独有 <b>XHTTP</b>(过 CDN 最好) 和 <b>mKCP</b>(抗丢包)
+   两种传输层，而 Hysteria2 / TUIC / AnyTLS 这类只有 sing-box 有。<br>
+   两个核心各跑各的服务、各自一份配置，互不影响；没有 Xray 节点时服务不会启动，不占内存。</p>
+   <div class="acts"><button onclick="xInstall('')">安装最新版 ${r.latest?esc(r.latest):''}</button></div></div>`}
+ const rows=(r.list||[]).map(v=>{const isCur=v.ver===r.current;
+   return `<div class="scanrow${isCur?' vcur':''}">
+    <span>${v.ver} ${v.pre?'<span class="vtag pre">预发布</span>':'<span class="vtag rel">正式版</span>'}
+    <i style="color:#6b7280;font-style:normal;font-size:12px">${v.date}</i></span>
+    ${isCur?'<b style="color:#3ddc84">使用中</b>'
+           :`<button class="btn2" style="padding:4px 12px;font-size:12px" onclick="xInstall('${v.ver}')">切换</button>`}
+   </div>`}).join('');
+ const up=r.has_update?`<div class="alert" style="background:#16241c;border-color:#2d7f4f;color:#8ff0b5">
+   Xray 有新版本 <b>${esc(r.latest)}</b>（当前 ${esc(r.current)}）
+   <div class="acts"><button onclick="xInstall('${r.latest}')">升级</button></div></div>`:'';
+ return `<div class="card"><h3>Xray-core <span class="badge bx">${esc(r.current||'?')}</span></h3>
+  ${up}
+  <div class="row"><span>节点数</span><span><b>${r.nodes}</b></span></div>
+  <div class="scanlist" style="margin-top:10px">${rows}</div>
+  <div class="acts"><button class="btn2" onclick="doRestart('xray')">重启 Xray</button>
+  ${r.nodes?'':'<button class="btnd" onclick="xUninstall()">卸载 Xray</button>'}</div></div>`}
+
+async function xInstall(v){
+ if(!confirm(v?('切换 Xray 到 '+v+'？'):'安装最新版 Xray-core？'))return;
+ const r=await api('/xray-install','POST',{version:v});
+ if(!r.ok)return msg(r.msg);
+ msg('正在安装，请稍候…',1);
+ const t=setInterval(async()=>{
+  let j;try{j=await api('/xray-job')}catch(e){return}
+  if(j.running){msg((j.step||'处理中')+'…',1);return}
+  clearInterval(t);
+  if(j.ok===false)alert('失败：'+j.msg);else msg('Xray 已就绪 '+(j.msg||''),1);
+  loadVer();refresh()},1500)}
+
+async function xUninstall(){if(!confirm('卸载 Xray-core？（需先删光 Xray 节点）'))return;
+ const r=await api('/xray-uninstall','POST',{});
+ msg(r.msg,r.ok?1:0);if(r.ok){loadVer();refresh()}}
+
+async function doRestart(core){const r=await api('/restart','POST',{core:core||'all'});
+ msg(r.ok?'已重启':(r.msg||'重启失败'),r.ok?1:0);setTimeout(refresh,1200)}
+
 async function loadVer(){const box=document.getElementById('verbox');
  box.innerHTML='<div class="card"><div class="scanning">检查更新中…</div></div>';
  const r=await api('/versions');
@@ -2241,6 +3285,7 @@ async function loadVer(){const box=document.getElementById('verbox');
      ${isCur?'<b style="color:#3ddc84">使用中</b>'
             :`<button class="btn2" style="padding:4px 12px;font-size:12px" onclick="doInstall('${v.ver}')">切换</button>`}
    </div>`}).join('');
+ const xh=await xrayCard();
  const dk=await api('/disk').catch(()=>null);
  let disk='';
  if(dk){const root=dk['/']||{},t=dk['/tmp']||{};
@@ -2251,7 +3296,7 @@ async function loadVer(){const box=document.getElementById('verbox');
    <div class="acts"><button class="btn2" onclick="doClean(0)">清理残留</button>
    <button class="btn2" onclick="doClean(1)">深度清理 (含apt/日志)</button></div>
    <p style="color:#8b93a1;font-size:12px;margin-top:8px">升级需要约 100MB。后台每 12 小时自动清理一次残留</p></div>`}
- box.innerHTML=banner+disk+`<div class="card"><h3>当前版本</h3>
+ box.innerHTML=banner+xh+disk+`<div class="card"><h3>当前版本</h3>
    <div class="row"><span>版本</span><span><b>${esc(cur)}</b></span></div>
    <div class="row"><span>锁定</span><span>${pin?`<b style="color:#f0c674">${esc(pin)}</b>`:'未锁定'}</span></div>
    <div class="acts">
@@ -2333,7 +3378,11 @@ async function saveSubToken(){
   <div class="uri" onclick="cp(this.textContent)">${esc(r.url)}</div>
   <p style="color:#f0c674;font-size:12px;margin-top:8px">旧地址已失效，请更新所有客户端</p>
   <div class="acts"><button onclick="closeM();loadSub()">完成</button></div>`}
-async function loadLog(){const r=await api('/logs');document.getElementById('logbox').textContent=r.log}
+async function loadLog(){const r=await api('/logs?core='+LOGCORE);
+ document.getElementById('logbox').textContent=r.log||'（无日志）'}
+function pickLog(c){LOGCORE=c;
+ document.querySelectorAll('#v-log .seg').forEach(e=>e.classList.toggle('active',e.dataset.l===c));
+ loadLog()}
 function esc(s){return String(s).replace(/[<>&"]/g,c=>({'<':'&lt;','>':'&gt;','&':'&amp;','"':'&quot;'}[c]))}
 async function editNode(t0){const t=decodeURIComponent(t0);
  const d=await api('/inbound-detail/'+encodeURIComponent(t));
@@ -2341,32 +3390,52 @@ async function editNode(t0){const t=decodeURIComponent(t0);
  const spec=PROTOS[d.proto];
  if(!spec)return msg('未知协议');
  document.getElementById('mbox').innerHTML=`<h2>编辑节点 · ${esc(d.name)}</h2>
-  <p style="color:#8b93a1;font-size:12px;margin-bottom:6px">协议：${esc(spec.label)}（不可更改）· 出站绑定保持不变</p>
+  <p style="color:#8b93a1;font-size:12px;margin-bottom:6px">协议：${esc(spec.label)} · 核心：<b>${d.core==='xray'?'Xray-core':'sing-box'}</b>（均不可更改）· 出站绑定保持不变</p>
   <div id="fields"></div>
-  <div class="acts"><button onclick="saveEdit('${encodeURIComponent(t)}','${d.proto}')">保存</button>
+  <div class="acts"><button onclick="saveEdit('${encodeURIComponent(t)}','${d.proto}','${d.core}')">保存</button>
   <button class="btn2" onclick="closeM()">取消</button></div>`;
  document.getElementById('modal').classList.add('show');
  if(spec.needs_cert&&!CERTS.length){const cr=await api('/certs');CERTS=cr.certs||[]}
  const gv=f=>d.fields[f.k]!==undefined?String(d.fields[f.k]):(f.d||'');
- document.getElementById('fields').innerHTML=
-   spec.fields.map(f=>fld(f,gv(f))).join('')+advHTML(spec,gv)}
-async function saveEdit(t0,proto){const t=decodeURIComponent(t0);
- const fs=collectF(PROTOS[proto]);
+ document.getElementById('fields').innerHTML=buildForm(spec,gv,d.core)}
+async function saveEdit(t0,proto,core){const t=decodeURIComponent(t0);
+ const fs=collectF(PROTOS[proto],core);
  const r=await api('/inbound-edit/'+encodeURIComponent(t),'POST',{proto:proto,fields:fs});
  if(r.ok){closeM();msg('已保存，客户端需重新拉订阅',1);loadIn();refresh()}else alert(r.msg)}
-function newNode(){const opts=Object.entries(PROTOS).map(([k,v])=>`<option value="${k}">${v.label}</option>`).join('');
- document.getElementById('mbox').innerHTML=`<h2>添加节点</h2><label>协议</label><select id="proto" onchange="renderF()">${opts}</select><div id="fields"></div>
+function newNode(){
+ const xok=!!ST.xray_installed;
+ document.getElementById('mbox').innerHTML=`<h2>添加节点</h2>
+ <label>运行核心 <span class="hint">决定这个节点由哪个程序跑，可用协议随之变化</span></label>
+ <div class="segs">
+  <div class="seg active" data-c="sing-box" onclick="pickCore('sing-box')">sing-box</div>
+  <div class="seg${xok?'':' dis'}" data-c="xray" onclick="${xok?"pickCore('xray')":"msg('请先到「版本」页安装 Xray-core')"}">Xray-core${xok?'':' (未安装)'}</div>
+ </div>
+ <label>协议</label><select id="proto" onchange="renderF()"></select><div id="fields"></div>
  <div class="acts"><button onclick="saveNode()">创建</button><button class="btn2" onclick="closeM()">取消</button></div>`;
- document.getElementById('modal').classList.add('show');renderF()}
+ document.getElementById('modal').classList.add('show');pickCore('sing-box')}
+
+// 当前添加表单选中的核心
+let NEWCORE='sing-box';
+function pickCore(c){NEWCORE=c;
+ document.querySelectorAll('.seg').forEach(e=>e.classList.toggle('active',e.dataset.c===c));
+ const sel=document.getElementById('proto'),keep=sel.value;
+ const list=Object.entries(PROTOS).filter(([k,v])=>(v.cores||['sing-box']).indexOf(c)>=0);
+ sel.innerHTML=list.map(([k,v])=>`<option value="${k}">${v.label}</option>`).join('');
+ if(list.some(([k])=>k===keep))sel.value=keep;
+ renderF()}
+
+// 该协议在当前核心下的高级选项
+function advOf(spec,core){return (core==='xray'?spec.adv_xray:spec.adv)||[]}
 async function renderF(){const p=document.getElementById('proto').value,spec=PROTOS[p];
+ if(!spec)return;
  if(spec.needs_cert&&!CERTS.length){const cr=await api('/certs');CERTS=cr.certs||[]}
  const a=await api('/autofill');
  const gv=f=>f.auto?(a[f.auto]||''):(f.d||'');
- document.getElementById('fields').innerHTML=
-   spec.fields.map(f=>fld(f,gv(f))).join('')+advHTML(spec,gv)}
+ document.getElementById('fields').innerHTML=buildForm(spec,gv,NEWCORE)}
 
 // 单个字段 -> HTML
 function fld(f,v){v=v===undefined?'':String(v);
+ if(f.t==='note')return `<div class="alert" style="margin-top:12px">${esc(f.l)}</div>`;
  const h=f.h?`<span class="hint">${esc(f.h)}</span>`:'';
  if(f.t==='bool')return `<label class="chk"><input type="checkbox" id="f-${f.k}" ${v==='1'?'checked':''}><span>${esc(f.l)}</span>${f.h?`<i>${esc(f.h)}</i>`:''}</label>`;
  if(f.t==='cert'){const o=CERTS.map(c=>`<option value="${c.domain}" ${c.domain===v?'selected':''}>${c.domain}</option>`).join('');
@@ -2376,20 +3445,27 @@ function fld(f,v){v=v===undefined?'':String(v);
   <input id="f-${f.k}" type="text" value="${esc(v)}"><div id="scanres"></div>`;
  return `<label>${esc(f.l)}${h}</label><input id="f-${f.k}" type="${f.t}" value="${esc(v)}">`}
 
-const TRKEYS=['transport','tr_path','tr_host','tr_ed'];
-// 高级选项折叠区
-function advHTML(spec,gv){const a=spec.adv||[];if(!a.length)return '';
- const perf=a.filter(f=>TRKEYS.indexOf(f.k)<0),tr=a.filter(f=>TRKEYS.indexOf(f.k)>=0);
- let out='';
- if(perf.length)out+=`<details><summary>高级选项 · 性能与抗封锁（${perf.length}）</summary>
-  <div class="dbody">${perf.map(f=>fld(f,gv(f))).join('')}</div></details>`;
- if(tr.length)out+=`<details><summary>传输层设置（可过 CDN）</summary>
-  <div class="dbody">${tr.map(f=>fld(f,gv(f))).join('')}</div></details>`;
- return out}
+const GROUPS=['基础配置','协议','传输','安全','嗅探','高级配置'];
+// 按分组渲染成标签页（所有字段都留在 DOM 里，切换只改显示）
+function buildForm(spec,gv,core){
+ const all=(spec.fields||[]).concat(advOf(spec,core||'sing-box'));
+ const by={};GROUPS.forEach(g=>by[g]=[]);
+ all.forEach(f=>{const g=by[f.g]?f.g:'高级配置';by[g].push(f)});
+ const live=GROUPS.filter(g=>by[g].length);
+ const tabs=live.map((g,i)=>
+  `<div class="ftab${i?'':' active'}" data-g="${g}" onclick="fgo('${g}')">${g}<b>${by[g].length}</b></div>`).join('');
+ const panes=live.map((g,i)=>
+  `<div class="fpane" data-g="${g}"${i?' hidden':''}>${by[g].map(f=>fld(f,gv(f))).join('')}</div>`).join('');
+ return `<div class="ftabs">${tabs}</div>${panes}`}
+function fgo(g){
+ document.querySelectorAll('.ftab').forEach(e=>e.classList.toggle('active',e.dataset.g===g));
+ document.querySelectorAll('.fpane').forEach(e=>e.hidden=(e.dataset.g!==g))}
 
 // 收集表单（含高级选项）
-function collectF(spec){const fs={};
- (spec.fields||[]).concat(spec.adv||[]).forEach(f=>{const e=document.getElementById('f-'+f.k);
+function collectF(spec,core){const fs={};
+ (spec.fields||[]).concat(advOf(spec,core||'sing-box')).forEach(f=>{
+  if(f.t==='note')return;
+  const e=document.getElementById('f-'+f.k);
   if(e)fs[f.k]=(f.t==='bool')?(e.checked?'1':'0'):e.value});
  return fs}
 async function scanDest(){const box=document.getElementById('scanres');
@@ -2406,8 +3482,8 @@ async function scanDest(){const box=document.getElementById('scanres');
 function pickDest(h){document.getElementById('f-dest').value=h;
  document.getElementById('scanres').innerHTML='';msg('已选用 '+h,1)}
 async function saveNode(){const p=document.getElementById('proto').value;
- const fs=collectF(PROTOS[p]);
- const r=await api('/inbounds','POST',{proto:p,fields:fs});
+ const fs=collectF(PROTOS[p],NEWCORE);
+ const r=await api('/inbounds','POST',{proto:p,core:NEWCORE,fields:fs});
  if(r.ok){closeM();msg('节点已创建',1);loadIn();refresh()}else msg(r.msg)}
 async function delIn(t0){const t=decodeURIComponent(t0);if(!confirm('删除节点 '+t+'?'))return;const r=await api('/inbounds/'+encodeURIComponent(t),'DELETE');
  if(r.ok){msg('已删除',1);loadIn();refresh()}else msg(r.msg)}
@@ -2468,7 +3544,8 @@ function obPayload(){const g=id=>document.getElementById(id);
 
 async function newOut(){const nodes=await api('/inbounds');
  const list=nodes.length?nodes.map(n=>`<label class="chk"><input type="checkbox" class="nd" value="${n.tag}">
-   <span>${esc(n.name)} <i>${n.type} · ${n.port}</i>${n.bind!=='direct'?`<em>当前: ${esc(n.bind)}</em>`:''}</span></label>`).join('')
+   <span>${esc(n.name)}</span><span class="badge ${n.core==='xray'?'bx':'bs'}">${n.core==='xray'?'Xray':'sb'}</span>
+   <i>${n.type} · ${n.port}</i>${n.bind!=='direct'?`<em>当前: ${esc(n.bind)}</em>`:''}</label>`).join('')
    :'<div style="color:#5a626e;font-size:13px;padding:6px 0">还没有节点</div>';
  document.getElementById('mbox').innerHTML=`<h2>添加出站</h2>${obForm(null)}
  <label style="margin-top:14px">绑定节点 (可多选，选中的节点全部流量走此出站)
@@ -2564,7 +3641,8 @@ async function pollCert(){
      box.innerHTML='✗ '+esc(s.msg).replace(/\n/g,'<br>');return}
  }
  const box=document.getElementById('cstat');if(box)box.textContent='超时，请查看服务器日志';}
-async function restart(){const r=await api('/restart','POST');msg(r.ok?'已重启':'失败',r.ok);refresh()}
+async function restart(){const r=await api('/restart','POST',{core:'all'});
+ msg(r.ok?'已重启':'失败',r.ok);refresh()}
 // 仅当「按下」和「松开」都在遮罩上才关闭——避免拖选文字时误关
 let _mdOnMask=false;
 document.getElementById('modal').addEventListener('mousedown',e=>{_mdOnMask=(e.target.id==='modal')});
@@ -2679,7 +3757,9 @@ class Handler(QuietMixin, BaseHTTPRequestHandler):
         return self._guard(self._do_DELETE)
 
     def _do_GET(self):
-        raw = urllib.parse.urlparse(self.path).path
+        _u = urllib.parse.urlparse(self.path)
+        raw = _u.path
+        q = urllib.parse.parse_qs(_u.query)
         if raw == "/__ping":
             return self._send(200, b"pong", "text/plain")
         p = self._strip_base(raw)
@@ -2733,7 +3813,23 @@ class Handler(QuietMixin, BaseHTTPRequestHandler):
                                         "uot": bool(o.get("udp_over_tcp"))})
             if p.startswith("/api/inbound-detail/"):
                 t = urllib.parse.unquote(p[len("/api/inbound-detail/"):])
-                info = meta().get(t, {})
+                m0 = meta()
+                info = m0.get(t, {})
+                core = core_of(t, m0)
+                if core == "xray":
+                    ib = next((i for i in xcfg().get("inbounds", [])
+                               if i.get("tag") == t), None)
+                    if not ib:
+                        return self._send(200, {"ok": False, "msg": "节点不存在"})
+                    proto = info.get("proto") or ""
+                    if proto not in PROTOCOLS:
+                        return self._send(200, {"ok": False,
+                                                "msg": f"暂不支持编辑该类型：{ib.get('protocol')}"})
+                    fields = info.get("fields") or xinbound_to_fields(ib, proto, info)
+                    return self._send(200, {"ok": True, "tag": t, "proto": proto,
+                                            "core": "xray", "fields": fields,
+                                            "port": ib.get("port"),
+                                            "name": info.get("name", t)})
                 ib = next((i for i in cfg().get("inbounds", []) if i.get("tag") == t), None)
                 if not ib:
                     return self._send(200, {"ok": False, "msg": "节点不存在"})
@@ -2745,7 +3841,7 @@ class Handler(QuietMixin, BaseHTTPRequestHandler):
                 if not fields:
                     fields = inbound_to_fields(ib, proto, info)   # 旧节点反推
                 return self._send(200, {"ok": True, "tag": t, "proto": proto,
-                                        "fields": fields,
+                                        "core": "sing-box", "fields": fields,
                                         "port": ib.get("listen_port"),
                                         "name": info.get("name", t)})
             if p == "/api/certs":
@@ -2794,13 +3890,26 @@ class Handler(QuietMixin, BaseHTTPRequestHandler):
             if p == "/api/disk":
                 return self._send(200, disk_report())
             if p == "/api/logs":
-                _, log, _ = sh("journalctl -u sing-box -n 80 --no-pager")
-                return self._send(200, {"log": log})
+                which = q.get("core", ["sing-box"])[0]
+                svc = XR_SVC if which == "xray" else "sing-box"
+                _, log, _ = sh(f"journalctl -u {svc} -n 80 --no-pager")
+                return self._send(200, {"log": log or f"（{svc} 无日志）"})
             if p.startswith("/api/test/"):
                 tag = urllib.parse.unquote(p[len("/api/test/"):])
                 return self._send(200, api_test_outbound(tag))
             if p == "/api/scan":
                 return self._send(200, scan_dests())
+            if p == "/api/xray-versions":
+                lst = xr_fetch_versions()
+                cur = xr_version()
+                latest = lst[0]["ver"] if lst else ""
+                return self._send(200, {
+                    "installed": xr_installed(), "current": cur, "list": lst,
+                    "latest": latest,
+                    "has_update": bool(latest and cur and latest != cur),
+                    "nodes": len(xcfg().get("inbounds", [])) if xr_installed() else 0})
+            if p == "/api/xray-job":
+                return self._send(200, XVER_JOB)
             if p == "/api/versions":
                 pin = ""
                 if os.path.exists(VER_PIN):
@@ -2830,7 +3939,11 @@ class Handler(QuietMixin, BaseHTTPRequestHandler):
         if p == "/api/login":
             pc = load_json(PANEL_CFG, {})
             h = hashlib.sha256((b.get("password", "") + pc.get("salt", "")).encode()).hexdigest()
-            if h == pc.get("pwhash"):
+            # 旧配置没有 username 字段时不校验用户名，保证升级后仍能登录
+            want_user = pc.get("username", "")
+            got_user = (b.get("username") or "").strip()
+            user_ok = (not want_user) or (got_user == want_user)
+            if user_ok and h == pc.get("pwhash"):
                 now = time.time()
                 # 清理过期会话，防止长期运行内存增长
                 for k in [k for k, v in SESSIONS.items() if v <= now]:
@@ -2877,8 +3990,36 @@ class Handler(QuietMixin, BaseHTTPRequestHandler):
                                         "msg": ("已清理：" + "、".join(freed)) if freed else "没有可清理的内容",
                                         "disk": disk_report()})
             if p == "/api/restart":
+                which = b.get("core") or "sing-box"
+                if which == "xray":
+                    if not xr_installed():
+                        return self._send(200, {"ok": False, "msg": "Xray-core 未安装"})
+                    c, _, _ = sh(f"systemctl restart {XR_SVC}")
+                    return self._send(200, {"ok": c == 0})
+                if which == "all":
+                    c, _, _ = sh("systemctl restart sing-box")
+                    if xr_installed() and xcfg().get("inbounds"):
+                        sh(f"systemctl restart {XR_SVC}")
+                    return self._send(200, {"ok": c == 0})
                 c, _, _ = sh("systemctl restart sing-box")
                 return self._send(200, {"ok": c == 0})
+            if p == "/api/xray-install":
+                ver = (b.get("version") or "").strip()
+                if not ver:
+                    lst = xr_fetch_versions(1)
+                    if not lst:
+                        return self._send(200, {"ok": False, "msg": "拉取版本列表失败"})
+                    ver = lst[0]["ver"]
+                okk, msg = xr_install_async(ver)
+                return self._send(200, {"ok": okk, "msg": msg, "async": True})
+            if p == "/api/xray-uninstall":
+                if xcfg().get("inbounds"):
+                    return self._send(200, {"ok": False,
+                                            "msg": "请先删除所有 Xray 节点再卸载"})
+                sh(f"systemctl disable --now {XR_SVC} >/dev/null 2>&1")
+                sh("rm -f /etc/systemd/system/xray.service; systemctl daemon-reload")
+                sh(f"rm -rf {os.path.dirname(XR_BIN)} {XR_ETC}")
+                return self._send(200, {"ok": True, "msg": "Xray-core 已卸载"})
             if p == "/api/install-version":
                 ver = (b.get("version") or "").strip()
                 if VER_JOB["running"]:

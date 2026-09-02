@@ -606,7 +606,10 @@ PROTOCOLS = {
             {"k": "name", "l": "节点名称", "t": "text", "d": "节点-hysteria2"},
             {"k": "port", "l": "监听端口", "t": "number", "auto": "port"},
             {"k": "password", "l": "认证密码", "t": "text", "auto": "pass"},
-            {"k": "obfs", "l": "混淆密码 (留空不启用)", "t": "text", "auto": "pass"},
+            {"k": "obfs_type", "l": "混淆方式", "t": "select",
+             "opts": ["salamander (推荐，开销最小)", "gecko (随机包长，抗特征更强)", "关闭"],
+             "d": "salamander (推荐，开销最小)"},
+            {"k": "obfs", "l": "混淆密码 (留空则不启用混淆)", "t": "text", "auto": "pass"},
             {"k": "cert", "l": "证书域名", "t": "cert"},
             {"k": "up", "l": "上行带宽 Mbps (0=不限，启用Brutal需填)", "t": "number", "d": "0"},
             {"k": "down", "l": "下行带宽 Mbps (0=不限)", "t": "number", "d": "0"},
@@ -820,8 +823,23 @@ TRANSPORTS = [
      "h": "首包塞进握手，省一个 RTT（仅 WebSocket 生效）"},
 ]
 
+ADV_HY2 = [
+    {"k": "bbr", "l": "BBR 档位", "t": "select",
+     "opts": ["standard (默认)", "aggressive (抢带宽更积极)", "conservative (最温和)"],
+     "d": "standard (默认)",
+     "h": "服务端发数据用的拥塞控制档位，直接影响客户端的下载速度。"
+          "拥堵线路可试 aggressive；变差就退回 standard"},
+    {"k": "force_bbr", "l": "强制客户端也用 BBR", "t": "bool", "d": "0",
+     "h": "上下行留空时生效。防止客户端自己声明带宽而切成 Brutal —— "
+          "Brutal 无视丢包硬发，拥堵线路上只会更糟"},
+    {"k": "gecko_min", "l": "gecko 最小包长", "t": "number", "d": "512",
+     "h": "仅 gecko 混淆生效。小包会被填充到这个长度，调大更抗特征但更费带宽"},
+    {"k": "gecko_max", "l": "gecko 最大包长", "t": "number", "d": "1200",
+     "h": "仅 gecko 混淆生效。别超过链路 MTU，否则会分片"},
+]
+
 _ADV_MAP = {
-    "hysteria2":   ADV_UDP,
+    "hysteria2":   ADV_UDP + ADV_HY2,
     "hysteria":    ADV_UDP,
     "tuic":        ADV_UDP,
     "vless":       ADV_TCP + ADV_UDP + ADV_MUX,
@@ -1003,10 +1021,27 @@ def build_inbound(proto, f, tag):
                             "Commercial support is available at "
                             "<a href=\"http://nginx.com/\">nginx.com</a>.</p>"
                             "<p><em>Thank you for using nginx.</em></p></body></html>")}
+        # BBR 档位：只有上下行留空（即真的走 BBR）时才写，填了带宽是 Brutal，写了也无效
+        _bbr = str(f.get("bbr", "")).split()[0] if f.get("bbr") else "standard"
+        if up <= 0 and dn <= 0 and _bbr in ("conservative", "aggressive"):
+            ib["bbr_profile"] = _bbr
+        # 强制客户端用 BBR，防止它自己声明带宽切成 Brutal
+        if up <= 0 and dn <= 0 and _bl(f, "force_bbr"):
+            ib["ignore_client_bandwidth"] = True
+
         q = f"security=tls&sni={domain}&insecure=0&fastopen=0&alpn=h3"
-        if f.get("obfs"):
-            ib["obfs"] = {"type": "salamander", "password": f["obfs"]}
-            q += f"&obfs=salamander&obfs-password={uenc(f['obfs'])}"
+        _ot = str(f.get("obfs_type", "salamander")).split()[0]
+        if f.get("obfs") and _ot != "关闭":
+            ob = {"type": _ot, "password": f["obfs"]}
+            if _ot == "gecko":
+                try:
+                    gmin, gmax = int(f.get("gecko_min") or 512), int(f.get("gecko_max") or 1200)
+                except (TypeError, ValueError):
+                    gmin, gmax = 512, 1200
+                if 0 < gmin <= gmax:
+                    ob["min_packet_size"], ob["max_packet_size"] = gmin, gmax
+            ib["obfs"] = ob
+            q += f"&obfs={_ot}&obfs-password={uenc(f['obfs'])}"
         if f.get("hop"):
             q += f"&mport={f['hop']}"
         uri = f"hysteria2://{uenc(f['password'])}@{domain}:{port}?{q}#{uenc(name)}"
@@ -1565,7 +1600,19 @@ def inbound_to_fields(ib, proto, info):
 
     if proto == "hysteria2":
         f["password"] = u0.get("password", "")
-        f["obfs"] = (ib.get("obfs") or {}).get("password", "")
+        _ob = ib.get("obfs") or {}
+        f["obfs"] = _ob.get("password", "")
+        f["obfs_type"] = {
+            "salamander": "salamander (推荐，开销最小)",
+            "gecko": "gecko (随机包长，抗特征更强)",
+        }.get(_ob.get("type"), "关闭" if not _ob else "salamander (推荐，开销最小)")
+        f["gecko_min"] = str(_ob.get("min_packet_size", 512) or 512)
+        f["gecko_max"] = str(_ob.get("max_packet_size", 1200) or 1200)
+        f["bbr"] = {
+            "aggressive": "aggressive (抢带宽更积极)",
+            "conservative": "conservative (最温和)",
+        }.get(ib.get("bbr_profile"), "standard (默认)")
+        f["force_bbr"] = "1" if ib.get("ignore_client_bandwidth") else "0"
         f["up"] = str(ib.get("up_mbps", 0) or 0)
         f["down"] = str(ib.get("down_mbps", 0) or 0)
         mq = ib.get("masquerade")

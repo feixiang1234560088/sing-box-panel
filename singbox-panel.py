@@ -556,6 +556,22 @@ def prune_orphan_rules(c):
     return removed
 
 
+def _wait_active(unit, timeout=12):
+    """轮询等待服务真正 active。sing-box 要绑端口、载证书，1 秒往往不够，
+    以前只 sleep(1) 就判定失败，会误触发回滚并再重启一次。"""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        _, st, _ = sh(f"systemctl is-active {unit}", 5)
+        st = st.strip()
+        if st == "active":
+            return True
+        if st in ("failed", "inactive"):
+            return False
+        time.sleep(0.5)
+    _, st, _ = sh(f"systemctl is-active {unit}", 5)
+    return st.strip() == "active"
+
+
 def apply_config(new_cfg):
     """校验并写入，失败自动回滚"""
     try:
@@ -575,14 +591,17 @@ def apply_config(new_cfg):
             with open(SB_CONF, "w") as f:
                 f.write(old)
         return False, (e or o or "配置校验失败")
-    c2, _, e2 = sh("systemctl restart sing-box")
-    time.sleep(1)
-    c3, st, _ = sh("systemctl is-active sing-box")
-    if st.strip() != "active":
+    # 先清掉 systemd 的启动失败计数，否则短时间内多次重启会撞上
+    # StartLimitBurst（默认 10 秒 5 次），单元被打成 failed 后不再自动拉起
+    sh("systemctl reset-failed sing-box")
+    sh("systemctl restart sing-box")
+    if not _wait_active("sing-box"):
         if old is not None:
             with open(SB_CONF, "w") as f:
                 f.write(old)
+            sh("systemctl reset-failed sing-box")
             sh("systemctl restart sing-box")
+            _wait_active("sing-box")          # 确认回滚后真的起来了
         _, log, _ = sh("journalctl -u sing-box -n 15 --no-pager")
         return False, f"启动失败已回滚:\n{log}"
     return True, "ok"
@@ -1022,7 +1041,7 @@ def build_inbound(proto, f, tag):
                             "<a href=\"http://nginx.com/\">nginx.com</a>.</p>"
                             "<p><em>Thank you for using nginx.</em></p></body></html>")}
         # BBR 档位：只有上下行留空（即真的走 BBR）时才写，填了带宽是 Brutal，写了也无效
-        _bbr = str(f.get("bbr", "")).split()[0] if f.get("bbr") else "standard"
+        _bbr = (str(f.get("bbr") or "").split() or ["standard"])[0]
         if up <= 0 and dn <= 0 and _bbr in ("conservative", "aggressive"):
             ib["bbr_profile"] = _bbr
         # 强制客户端用 BBR，防止它自己声明带宽切成 Brutal
@@ -1030,7 +1049,9 @@ def build_inbound(proto, f, tag):
             ib["ignore_client_bandwidth"] = True
 
         q = f"security=tls&sni={domain}&insecure=0&fastopen=0&alpn=h3"
-        _ot = str(f.get("obfs_type", "salamander")).split()[0]
+        _ot = (str(f.get("obfs_type") or "").split() or ["salamander"])[0]
+        if _ot not in ("salamander", "gecko", "关闭"):
+            _ot = "salamander"
         if f.get("obfs") and _ot != "关闭":
             ob = {"type": _ot, "password": f["obfs"]}
             if _ot == "gecko":

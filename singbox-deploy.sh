@@ -98,8 +98,11 @@ Wants=network-online.target
 [Service]
 Type=simple
 ExecStart=$SB_BIN run -c $SB_CONF
-Restart=on-failure
-RestartSec=5s
+Restart=always
+RestartSec=3s
+# 不限制启动次数：面板改配置时会重启本服务，撞上 systemd 默认的
+# 10 秒 5 次限制会让单元卡在 failed 状态、不再自动拉起，必须人工干预
+StartLimitIntervalSec=0
 LimitNOFILE=1048576
 CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_BIND_SERVICE CAP_NET_RAW
 AmbientCapabilities=CAP_NET_ADMIN CAP_NET_BIND_SERVICE CAP_NET_RAW
@@ -770,7 +773,7 @@ setup_domain() {
                     HOME=/root "$acmebin" --install-cert -d "$dom" $ecc \
                         --fullchain-file "$CERT_DIR/$dom/fullchain.pem" \
                         --key-file "$CERT_DIR/$dom/privkey.pem" \
-                        --reloadcmd "systemctl restart sing-box; systemctl restart singbox-panel" >/dev/null 2>&1
+                        --reloadcmd "systemctl restart sing-box" >/dev/null 2>&1
                     ok "复用 acme.sh 本地证书（未消耗签发次数）"; need=0; break
                 fi
             done
@@ -811,7 +814,7 @@ setup_domain() {
         HOME=/root "$acmebin" --install-cert -d "$dom" --ecc \
             --fullchain-file "$CERT_DIR/$dom/fullchain.pem" \
             --key-file "$CERT_DIR/$dom/privkey.pem" \
-            --reloadcmd "systemctl restart sing-box; systemctl restart singbox-panel" >/dev/null 2>&1
+            --reloadcmd "systemctl restart sing-box" >/dev/null 2>&1
         systemctl start sing-box 2>/dev/null
         ok "证书已签发"
     fi

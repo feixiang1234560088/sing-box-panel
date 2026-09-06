@@ -244,8 +244,7 @@ def issue_cert(domain):
                 sh(f"{envp} --install-cert -d {domain} {ecc} "
                    f"--fullchain-file {CERT_DIR}/{domain}/fullchain.pem "
                    f"--key-file {CERT_DIR}/{domain}/privkey.pem "
-                   f'--reloadcmd "systemctl restart sing-box; '
-       f'systemd-run --collect --on-active=2 --unit=sbpanel-reload systemctl restart singbox-panel"', 60)
+                   f'--reloadcmd "systemctl restart sing-box"', 60)
                 if os.path.exists(f"{CERT_DIR}/{domain}/fullchain.pem"):
                     return True, "已复用本地现有证书（未消耗签发次数）"
 
@@ -289,8 +288,7 @@ def issue_cert(domain):
     sh(f"{envp} --install-cert -d {domain} --ecc "
        f"--fullchain-file {CERT_DIR}/{domain}/fullchain.pem "
        f"--key-file {CERT_DIR}/{domain}/privkey.pem "
-       f'--reloadcmd "systemctl restart sing-box; '
-       f'systemd-run --collect --on-active=2 --unit=sbpanel-reload systemctl restart singbox-panel"', 60)
+       f'--reloadcmd "systemctl restart sing-box"', 60)
     sh("systemctl start sing-box")
 
     _CERT_CACHE.update(t=0, v=[])
@@ -464,7 +462,75 @@ def janitor_loop():
         time.sleep(12 * 3600)
 
 
-HEARTBEAT = {"t": time.time()}
+HEARTBEAT = {"t": time.time(), "panel": 0.0, "sub": 0.0}
+
+# ════════════════════════════════════════════
+# 线程监管：后台线程崩了要自己爬起来，并留下痕迹
+# 以前是裸 daemon 线程，异常逃逸到顶层就静默消失，外部完全看不出来
+# ════════════════════════════════════════════
+SUPERVISED = {}          # name -> {alive, restarts, last_error, last_error_at, started_at}
+RUNLOG = []              # 最近的运行事件，健康接口和日志页共用
+
+
+def runlog(msg, level="info"):
+    RUNLOG.append({"t": time.strftime("%m-%d %H:%M:%S"), "level": level, "msg": str(msg)[:300]})
+    del RUNLOG[:-200]
+    if level in ("error", "warn"):
+        print(f"[{level}] {msg}", file=sys.stderr)
+
+
+def supervise(name, fn, *args, oneshot=False):
+    """启动一个受监管的常驻线程。
+
+    对常驻服务来说「正常返回」同样是故障（比如 serve_forever 被 shutdown），
+    所以除非显式声明 oneshot，返回和抛异常都会触发退避重启。
+    连续稳定运行超过 60 秒就把退避时间重置，避免长期服务偶尔重启一次后
+    背着几十秒的延迟。"""
+    st = SUPERVISED.setdefault(name, {"alive": False, "restarts": -1,
+                                      "last_error": "", "last_error_at": "",
+                                      "started_at": ""})
+
+    def wrapper():
+        delay = 5
+        while True:
+            st["alive"] = True
+            st["restarts"] += 1
+            st["started_at"] = time.strftime("%m-%d %H:%M:%S")
+            if st["restarts"]:
+                runlog(f"线程 {name} 第 {st['restarts']} 次重启", "warn")
+            t0 = time.time()
+            try:
+                fn(*args)
+                st["alive"] = False
+                if oneshot:
+                    return
+                st["last_error"] = "正常返回（常驻服务不应退出）"
+                st["last_error_at"] = time.strftime("%m-%d %H:%M:%S")
+                runlog(f"线程 {name} 退出了，准备重启", "warn")
+            except Exception as e:
+                st["alive"] = False
+                st["last_error"] = f"{type(e).__name__}: {e}"
+                st["last_error_at"] = time.strftime("%m-%d %H:%M:%S")
+                runlog(f"线程 {name} 异常退出: {st['last_error']}", "error")
+            if time.time() - t0 > 60:
+                delay = 5                        # 之前稳定跑过，退避归零
+            time.sleep(delay)
+            delay = min(delay * 2, 60)           # 5→10→20→40→60 封顶
+
+    t = threading.Thread(target=wrapper, name=name, daemon=True)
+    t.start()
+    return t
+
+
+def port_alive(host, port, timeout=5):
+    """端口是否还在监听（只做 TCP 连接，不发数据）"""
+    import socket as _sk
+    try:
+        with _sk.create_connection((host, port), timeout=timeout):
+            return True
+    except Exception:
+        return False
+
 
 
 def watchdog_loop(host, port, use_tls=False):
@@ -509,10 +575,42 @@ def watchdog_loop(host, port, use_tls=False):
             fails = 0
             continue
         fails += 1
-        print(f"[watchdog] 无响应且心跳陈旧 {fails}/3", file=sys.stderr)
+        runlog(f"面板无响应且心跳陈旧 {fails}/3", "warn")
         if fails >= 3:
-            print("[watchdog] 面板卡死，退出由 systemd 重启", file=sys.stderr)
+            runlog("面板卡死，退出由 systemd 重启", "error")
             os._exit(1)
+
+
+def sub_watchdog_loop():
+    """订阅服务专用看门狗：端口没在听就单独把它拉起来，不牵连整个进程。
+    这是 D1/D3 的正面修复 —— 以前订阅死了没有任何机制会发现。"""
+    time.sleep(90)
+    fails = 0
+    while True:
+        time.sleep(30)
+        port = SUB_STATE.get("port") or 0
+        if not port:
+            continue
+        if port_alive("127.0.0.1", port, timeout=5):
+            fails = 0
+            continue
+        fails += 1
+        runlog(f"订阅端口 {port} 无响应 {fails}/2", "warn")
+        if fails < 2:
+            continue
+        fails = 0
+        # 先把旧监听器关掉，让 supervisor 的重启循环接手
+        srv = SUB_STATE.get("server")
+        if srv is not None:
+            try:
+                srv.shutdown()
+            except Exception:
+                pass
+        # supervisor 线程若已整体退出，这里补一次启动
+        st = SUPERVISED.get("subscription") or {}
+        if not st.get("alive"):
+            runlog("订阅监管线程已不在，重新拉起", "warn")
+            supervise("subscription", sub_serve_forever, port)
 
 
 def safe_restart_self(delay=1):
@@ -1501,6 +1599,182 @@ def api_set_log(enabled, level=None):
                   else "日志已关闭，sing-box 不再写入 journald")
 
 
+START_TS = time.time()
+
+
+TLS_CTXS = {}          # name -> SSLContext，热重载时逐个换掉证书
+CERT_SIG = {"sig": "", "fails": 0}
+
+
+def _cert_sig(cert, key):
+    """证书+私钥的内容指纹。用内容而不是 mtime，避免 acme 只 touch 不换内容时空重载"""
+    h = hashlib.sha256()
+    for f in (cert, key):
+        try:
+            with open(f, "rb") as fh:
+                h.update(fh.read())
+        except Exception:
+            return ""
+    return h.hexdigest()
+
+
+def register_tls(name, ctx, cert, key):
+    TLS_CTXS[name] = {"ctx": ctx, "cert": cert, "key": key}
+    if not CERT_SIG["sig"]:
+        CERT_SIG["sig"] = _cert_sig(cert, key)
+
+
+def cert_reload_loop():
+    """证书热重载：acme 续期后就地换证书，不用重启进程。
+
+    SSLContext.load_cert_chain 可以重复调用，替换后的证书对
+    之后新建立的 TLS 握手生效，已有连接不受影响。
+    连续失败 3 次才退回重启进程这条粗暴路径。"""
+    time.sleep(60)
+    while True:
+        time.sleep(300)                       # 5 分钟看一次足够，证书 60 天才换一次
+        if not TLS_CTXS:
+            continue
+        one = next(iter(TLS_CTXS.values()))
+        sig = _cert_sig(one["cert"], one["key"])
+        if not sig or sig == CERT_SIG["sig"]:
+            continue                          # 没变，或文件读不出来（可能正在被写）
+
+        ok, failed = 0, []
+        for name, e in TLS_CTXS.items():
+            try:
+                e["ctx"].load_cert_chain(e["cert"], e["key"])
+                ok += 1
+            except Exception as ex:
+                failed.append(f"{name}: {type(ex).__name__}")
+
+        if failed:
+            CERT_SIG["fails"] += 1
+            runlog(f"证书热重载失败({CERT_SIG['fails']}/3): {'; '.join(failed)}", "error")
+            if CERT_SIG["fails"] >= 3:
+                runlog("热重载连续失败，退回重启进程", "warn")
+                CERT_SIG["fails"] = 0
+                safe_restart_self(2)
+            continue
+
+        CERT_SIG["sig"] = sig
+        CERT_SIG["fails"] = 0
+        d = cert_days_left(load_json(PANEL_CFG, {}).get("tls_domain", ""))
+        runlog(f"证书已热重载，{ok} 个监听器生效"
+               + (f"，新证书剩余 {d} 天" if d is not None else ""))
+
+
+def cert_days_left(dom):
+    """证书剩余天数；取不到返回 None"""
+    if not dom:
+        return None
+    f = f"{CERT_DIR}/{dom}/fullchain.pem"
+    if not os.path.exists(f):
+        return None
+    c, o, _ = sh(f"openssl x509 -enddate -noout -in {f}", 10)
+    if c != 0 or "=" not in o:
+        return None
+    try:
+        import calendar
+        t = time.strptime(o.split("=", 1)[1].strip(), "%b %d %H:%M:%S %Y %Z")
+        return int((calendar.timegm(t) - time.time()) // 86400)
+    except Exception:
+        return None
+
+
+def proc_rss_mb():
+    try:
+        with open(f"/proc/{os.getpid()}/status") as fh:
+            for ln in fh:
+                if ln.startswith("VmRSS:"):
+                    return round(int(ln.split()[1]) / 1024, 1)
+    except Exception:
+        pass
+    return None
+
+
+def api_health():
+    """一次性回答『现在各子系统是否正常』。免鉴权，不含任何敏感信息。"""
+    pc = load_json(PANEL_CFG, {})
+    dom = pc.get("tls_domain", "")
+    days = cert_days_left(dom)
+    _, sb_state, _ = sh("systemctl is-active sing-box", 5)
+    sb_state = sb_state.strip() or "unknown"
+    sub_port = SUB_STATE.get("port") or 0
+    sub_ok = bool(sub_port) and port_alive("127.0.0.1", sub_port, 3)
+
+    threads = {}
+    for name, st in SUPERVISED.items():
+        threads[name] = {"alive": st["alive"], "restarts": max(0, st["restarts"]),
+                         "started_at": st["started_at"],
+                         "last_error": st["last_error"],
+                         "last_error_at": st["last_error_at"]}
+
+    problems = []
+    if not sub_ok and sub_port:
+        problems.append("订阅端口未监听")
+    if sb_state != "active":
+        problems.append(f"sing-box 状态 {sb_state}")
+    for n, t in threads.items():
+        if not t["alive"]:
+            problems.append(f"线程 {n} 未运行")
+    if days is not None and days < 7:
+        problems.append(f"证书仅剩 {days} 天")
+
+    if problems:
+        level = "red" if any(k in " ".join(problems)
+                             for k in ("订阅端口", "未运行", "sing-box")) else "yellow"
+    elif days is not None and days < 15:
+        level, problems = "yellow", [f"证书剩余 {days} 天"]
+    else:
+        level = "green"
+
+    return {
+        "level": level,
+        "problems": problems,
+        "uptime_sec": int(time.time() - START_TS),
+        "rss_mb": proc_rss_mb(),
+        "threads": threads,
+        "subscription": {"port": sub_port, "scheme": SUB_STATE.get("scheme", "http"),
+                         "listening": sub_ok},
+        "singbox": {"state": sb_state, "inbounds": len(cfg().get("inbounds", []))},
+        "cert": {"domain": dom, "days_left": days,
+                 "hot_reload": bool(TLS_CTXS),
+                 "listeners": sorted(TLS_CTXS.keys()),
+                 "reload_fails": CERT_SIG["fails"]},
+        "heartbeat": {
+            "panel_ago": int(time.time() - HEARTBEAT["panel"]) if HEARTBEAT["panel"] else None,
+            "sub_ago": int(time.time() - HEARTBEAT["sub"]) if HEARTBEAT["sub"] else None,
+        },
+        "runlog": RUNLOG[-30:],
+    }
+
+
+def preflight(host, port, sub_port, dom):
+    """启动自检：有问题要明确说出来，而不是静默降级后半夜出事"""
+    import socket as _sk
+    ok = True
+    try:
+        cfg()
+    except Exception as e:
+        runlog(f"自检: sing-box 配置无法解析: {e}", "error"); ok = False
+    for nm, p_ in (("面板", port), ("订阅", sub_port)):
+        if not p_:
+            continue
+        if port_alive("127.0.0.1", p_, 2):
+            runlog(f"自检: {nm}端口 {p_} 已被占用", "error"); ok = False
+    if dom:
+        d = cert_days_left(dom)
+        if d is None:
+            runlog(f"自检: 证书 {dom} 不可读，将回退 HTTP", "warn")
+        elif d < 0:
+            runlog(f"自检: 证书 {dom} 已过期 {-d} 天", "error"); ok = False
+        elif d < 15:
+            runlog(f"自检: 证书 {dom} 仅剩 {d} 天", "warn")
+    runlog("自检完成" + ("" if ok else "（存在问题，见上）"))
+    return ok
+
+
 def api_status():
     _, ver, _ = sh(f"{SB_BIN} version")
     ver = ver.splitlines()[0].split()[-1] if ver else "未知"
@@ -2127,6 +2401,15 @@ select{cursor:pointer}
 .chk span{flex:0 0 auto;white-space:nowrap}
 .chk i{color:var(--tx3);font-style:normal;font-size:11.5px;line-height:1.45;flex:1;min-width:0}
 .chk em{color:var(--warn);font-style:normal;font-size:11px;margin-left:7px}
+.hbadge{font-size:11.5px;padding:3px 10px;border-radius:20px;cursor:pointer;
+ font-weight:600;white-space:nowrap;transition:.15s;border:1px solid transparent}
+.hbadge.green{background:rgba(52,211,153,.12);color:var(--ok);border-color:rgba(52,211,153,.3)}
+.hbadge.yellow{background:rgba(251,191,36,.12);color:var(--warn);border-color:rgba(251,191,36,.35)}
+.hbadge.red{background:rgba(248,113,113,.14);color:var(--err);border-color:rgba(248,113,113,.4)}
+.hgrid{display:grid;grid-template-columns:repeat(auto-fill,minmax(210px,1fr));gap:8px;margin-top:4px}
+.hitem{background:var(--bg2);border:1px solid var(--line);border-radius:var(--r2);padding:9px 11px}
+.hitem b{display:block;font-size:11.5px;color:var(--tx2);font-weight:500;margin-bottom:3px}
+.hitem span{font-size:13px}
 .chkbox{background:#0a0c10;border:1px solid var(--line2);border-radius:var(--r2);
  padding:5px;max-height:220px;overflow:auto}
 details{border:1px solid var(--line);border-radius:var(--r2);margin-top:14px;
@@ -2209,6 +2492,7 @@ body.mopen{overflow:hidden}      /* 弹窗打开时锁住背景，避免滚轮�
 </div>
 <div id="app" style="display:none"><div class="wrap">
 <header><h1>sing-box 面板</h1>
+  <span id="hbadge" class="hbadge" title="系统健康" onclick="tab('log')">检查中…</span>
   <div class="stat" id="stat"></div>
   <div style="display:flex;gap:8px">
     <button class="btn2" onclick="restart()">重启</button>
@@ -2231,7 +2515,13 @@ body.mopen{overflow:hidden}      /* 弹窗打开时锁住背景，避免滚轮�
  <div class="uri" id="suburl" onclick="cp(this.textContent)"></div>
  <div id="subinfo" style="margin-top:12px"></div></div></div>
 <div id="v-ver" style="display:none"><div id="verbox"></div></div>
-<div id="v-log" style="display:none"><div class="card">
+<div id="v-log" style="display:none">
+ <div class="card"><h3>系统健康 <span id="hdetail" class="badge">…</span></h3>
+  <div id="hbox"></div>
+  <div class="acts"><button class="btn2" onclick="loadHealth()">刷新</button></div></div>
+ <div class="card"><h3>面板运行日志 <span class="badge">自愈动作与异常</span></h3>
+  <pre id="runlog" style="max-height:240px"></pre></div>
+ <div class="card">
  <h3>sing-box 日志 <span id="log-badge" class="badge">…</span></h3>
  <div id="log-ctl"></div>
  <div class="acts" style="margin-bottom:10px"><button class="btn2" onclick="loadLog()">刷新</button></div>
@@ -2245,7 +2535,8 @@ let TK=localStorage.getItem('tk')||'',PROTOS={},CERTS=[],OUTS=[];
 function msg(t,ok){const e=document.getElementById('toast');e.textContent=t;e.className='toast show '+(ok?'ok':'err');setTimeout(()=>e.className='toast',3500)}
 async function api(p,m,b){const r=await fetch(BASE+'/api'+p,{method:m||'GET',headers:{'Content-Type':'application/json','X-Token':TK},body:b?JSON.stringify(b):null});
  if(r.status===401){TK='';localStorage.removeItem('tk');show(0);throw new Error('未登录')}return r.json()}
-function show(in_){document.getElementById('login').style.display=in_?'none':'block';document.getElementById('app').style.display=in_?'block':'none';if(in_)refresh()}
+function show(in_){document.getElementById('login').style.display=in_?'none':'block';document.getElementById('app').style.display=in_?'block':'none';
+ if(in_){refresh();startHealthPoll()}else if(_hTimer){clearInterval(_hTimer);_hTimer=null}}
 async function doLogin(){const pw=document.getElementById('pw').value;
  const us=document.getElementById('usr').value;
  const r=await(await fetch(BASE+'/api/login',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({username:us,password:pw})})).json();
@@ -2253,12 +2544,17 @@ async function doLogin(){const pw=document.getElementById('pw').value;
 function logout(){TK='';localStorage.removeItem('tk');show(0)}
 function tab(t){document.querySelectorAll('.tab').forEach(e=>e.classList.toggle('active',e.dataset.t===t));
  ['in','out','cert','sub','ver','log'].forEach(x=>document.getElementById('v-'+x).style.display=x===t?'block':'none');
- if(t==='cert')loadCerts();if(t==='sub')loadSub();if(t==='ver')loadVer();if(t==='log')loadLog()}
+ if(t==='cert')loadCerts();if(t==='sub')loadSub();if(t==='ver')loadVer();if(t==='log'){loadLog();loadHealth()}}
 function closeM(){document.getElementById('modal').classList.remove('show')}
 function cp(t){navigator.clipboard.writeText(t).then(()=>msg('已复制',1))}
 async function refresh(){const s=await api('/status');
  document.getElementById('stat').innerHTML=`<span><span class="dot ${s.running?'on':'off'}"></span>${s.running?'运行中':'已停止'}</span><span>版本 <b>${s.version}</b></span><span>IP <b>${s.ip}</b></span><span>节点 <b>${s.inbounds}</b></span><span>出站 <b>${s.outbounds}</b></span>`;
- PROTOS=await api('/protocols');loadIn();loadOut()}
+ PROTOS=await api('/protocols');loadIn();loadOut();loadHealth()}
+
+// 健康状态每 60 秒自查一次，异常会在顶栏徽章上直接显示
+let _hTimer=null;
+function startHealthPoll(){if(_hTimer)clearInterval(_hTimer);
+ _hTimer=setInterval(()=>{if(TK)loadHealth().catch(()=>{})},60000)}
 async function loadIn(){const l=await api('/inbounds');OUTS=await api('/outbounds');
  document.getElementById('inlist').innerHTML=l.length?l.map(n=>`<div class="card"><h3>${esc(n.name)}<span class="badge">${n.type}</span></h3>
   <div class="row"><span>标签</span><span>${n.tag}</span></div>
@@ -2449,6 +2745,35 @@ async function saveSubToken(){
   <div class="uri" onclick="cp(this.textContent)">${esc(r.url)}</div>
   <p style="color:#f0c674;font-size:12px;margin-top:8px">旧地址已失效，请更新所有客户端</p>
   <div class="acts"><button onclick="closeM();loadSub()">完成</button></div>`}
+function fmtDur(s){if(s==null)return '—';const d=Math.floor(s/86400),h=Math.floor(s%86400/3600),m=Math.floor(s%3600/60);
+ return d?`${d}天${h}小时`:(h?`${h}小时${m}分`:`${m}分`)}
+async function loadHealth(){let h;try{h=await api('/health')}catch(e){return}
+ const b=document.getElementById('hbadge');
+ const txt={green:'运行正常',yellow:'需要注意',red:'存在故障'}[h.level]||'未知';
+ b.className='hbadge '+h.level; b.textContent=txt+(h.problems.length?` · ${h.problems.length}`:'');
+ b.title=h.problems.join(' / ')||'所有子系统正常';
+ const d=document.getElementById('hdetail');
+ if(d){d.textContent=txt;d.style.cssText=h.level==='green'
+   ?'background:rgba(52,211,153,.14);color:var(--ok)':(h.level==='yellow'
+   ?'background:rgba(251,191,36,.14);color:var(--warn)':'background:rgba(248,113,113,.14);color:var(--err)')}
+ const box=document.getElementById('hbox'); if(!box)return;
+ const th=Object.entries(h.threads||{}).map(([n,t])=>
+   `<div class="hitem"><b>线程 ${esc(n)}</b><span>${t.alive?'<span style="color:var(--ok)">运行中</span>':'<span style="color:var(--err)">已停止</span>'}`
+   +(t.restarts?` · 重启 ${t.restarts} 次`:'')+`</span>`
+   +(t.last_error?`<div style="color:var(--tx3);font-size:11px;margin-top:3px">${esc(t.last_error)}</div>`:'')+`</div>`).join('');
+ const cert=h.cert.days_left==null?'未启用':`${h.cert.days_left} 天`;
+ const certColor=h.cert.days_left!=null&&h.cert.days_left<15?'var(--warn)':'var(--tx)';
+ box.innerHTML=(h.problems.length?`<div class="alert">${h.problems.map(esc).join('<br>')}</div>`:'')
+  +`<div class="hgrid">
+   <div class="hitem"><b>订阅服务</b><span>${h.subscription.listening
+     ?'<span style="color:var(--ok)">监听中</span>':'<span style="color:var(--err)">未监听</span>'} · ${h.subscription.scheme}:${h.subscription.port}</span></div>
+   <div class="hitem"><b>sing-box</b><span>${esc(h.singbox.state)} · ${h.singbox.inbounds} 个节点</span></div>
+   <div class="hitem"><b>证书剩余</b><span style="color:${certColor}">${cert}</span></div>
+   <div class="hitem"><b>面板内存</b><span>${h.rss_mb==null?'—':h.rss_mb+' MB'}</span></div>
+   <div class="hitem"><b>已运行</b><span>${fmtDur(h.uptime_sec)}</span></div>
+  </div><div class="hgrid">${th}</div>`;
+ const rl=document.getElementById('runlog');
+ if(rl)rl.textContent=(h.runlog||[]).map(x=>`[${x.level}] ${x.t}  ${x.msg}`).join('\n')||'（暂无事件）';}
 async function loadLog(){const r=await api('/logs');
  const st=r.state||await api('/log-state');
  renderLogCtl(st);
@@ -2760,7 +3085,7 @@ class Handler(QuietMixin, BaseHTTPRequestHandler):
         pass
 
     def _send(self, code, data, ctype="application/json"):
-        HEARTBEAT["t"] = time.time()
+        HEARTBEAT["t"] = HEARTBEAT["panel"] = time.time()
         self._sent = True
         body = data if isinstance(data, bytes) else json.dumps(data, ensure_ascii=False).encode()
         enc = ""
@@ -2838,6 +3163,10 @@ class Handler(QuietMixin, BaseHTTPRequestHandler):
         return self._guard(self._do_DELETE)
 
     def _do_GET(self):
+
+        # 健康检查免鉴权：出问题时往往正是登录不进去的时候
+        if self._strip_base(urllib.parse.urlparse(self.path).path) == "/api/health":
+            return self._send(200, api_health())
         raw = urllib.parse.urlparse(self.path).path
         if raw == "/__ping":
             return self._send(200, b"pong", "text/plain")
@@ -2871,6 +3200,8 @@ class Handler(QuietMixin, BaseHTTPRequestHandler):
         if True:
             if p == "/api/protocols":
                 return self._send(200, PROTOCOLS)
+            if p == "/api/health":
+                return self._send(200, api_health())
             if p == "/api/inbounds":
                 return self._send(200, api_inbounds())
             if p == "/api/outbounds":
@@ -3165,11 +3496,32 @@ class Handler(QuietMixin, BaseHTTPRequestHandler):
 class SubHandler(QuietMixin, BaseHTTPRequestHandler):
     """订阅服务：以 text/plain 返回，浏览器内联显示而非下载"""
     server_version = "sb-sub"
+    protocol_version = "HTTP/1.1"
+    timeout = 30
 
     def log_message(self, *a):
         pass
 
+    def handle_one_request(self):
+        HEARTBEAT["t"] = HEARTBEAT["sub"] = time.time()
+        super().handle_one_request()
+
     def do_GET(self):
+        try:
+            return self._do_GET()
+        except Exception as e:
+            runlog(f"订阅请求异常: {type(e).__name__}: {e}", "error")
+            try:
+                body = b"Internal Error"
+                self.send_response(500)
+                self.send_header("Content-Type", "text/plain; charset=utf-8")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+            except Exception:
+                pass
+
+    def _do_GET(self):
         u = urllib.parse.urlparse(self.path)
         token = u.path.lstrip("/")
         qs = urllib.parse.parse_qs(u.query)
@@ -3205,6 +3557,37 @@ class SubHandler(QuietMixin, BaseHTTPRequestHandler):
         self.wfile.write(body)
 
 
+SUB_STATE = {"port": 0, "scheme": "http", "listening": False, "server": None}
+
+
+def sub_serve_forever(sub_port):
+    """订阅监听器。异常抛出后由 supervisor 退避重启 —— 以前它是裸线程，
+    崩了端口就永久没了，而面板还活着，外部完全发现不了。"""
+    pc = load_json(PANEL_CFG, {})
+    srv = PanelHTTPServer(("0.0.0.0", sub_port), SubHandler)
+    scheme = "http"
+    dom = pc.get("tls_domain", "")
+    if dom:
+        sc, sk = f"{CERT_DIR}/{dom}/fullchain.pem", f"{CERT_DIR}/{dom}/privkey.pem"
+        if os.path.exists(sc) and os.path.exists(sk):
+            import ssl as _s
+            ctx = _s.SSLContext(_s.PROTOCOL_TLS_SERVER)
+            ctx.load_cert_chain(sc, sk)
+            srv.socket = ctx.wrap_socket(srv.socket, server_side=True)
+            register_tls("subscription", ctx, sc, sk)   # 交给 cert_reload_loop 热更新
+            scheme = "https"
+    SUB_STATE.update(scheme=scheme, listening=True, server=srv)
+    runlog(f"订阅服务已监听 {scheme}://{dom or '0.0.0.0'}:{sub_port}")
+    try:
+        srv.serve_forever(poll_interval=0.5)
+    finally:
+        SUB_STATE.update(listening=False, server=None)
+        try:
+            srv.server_close()               # 释放端口，否则重启时会 Address already in use
+        except Exception:
+            pass
+
+
 def run_sub_server():
     pc = load_json(PANEL_CFG, {})
     port = int(pc.get("sub_port", 8080))
@@ -3224,31 +3607,20 @@ def main():
         sys.exit(1)
     os.makedirs(SUB_DIR, exist_ok=True)
     rebuild_sub()
-    threading.Thread(target=janitor_loop, daemon=True).start()
-    threading.Thread(target=auto_update_loop, daemon=True).start()
+    preflight(host, port, int(pc.get("sub_port", 8080) or 0), pc.get("tls_domain", ""))
+    supervise("janitor", janitor_loop)
+    supervise("auto_update", auto_update_loop)
     _wd_tls = bool(pc.get("tls_domain")) and os.path.exists(
         f"{CERT_DIR}/{pc.get('tls_domain', '')}/fullchain.pem")
-    threading.Thread(target=watchdog_loop, args=(host, port, _wd_tls), daemon=True).start()
+    supervise("watchdog", watchdog_loop, host, port, _wd_tls)
+    supervise("sub_watchdog", sub_watchdog_loop)
+    supervise("cert_reload", cert_reload_loop)
 
-    # 订阅服务与面板同进程（省一个 Python 解释器约 20MB）
+    # 订阅服务与面板同进程（省一个 Python 解释器约 20MB），由 supervisor 看着
     sub_port = int(pc.get("sub_port", 8080))
     if sub_port and sub_port != port:
-        try:
-            subd = PanelHTTPServer(("0.0.0.0", sub_port), SubHandler)
-            sscheme = "http"
-            sdom = pc.get("tls_domain", "")
-            if sdom:
-                sc, sk = f"{CERT_DIR}/{sdom}/fullchain.pem", f"{CERT_DIR}/{sdom}/privkey.pem"
-                if os.path.exists(sc) and os.path.exists(sk):
-                    import ssl as _s
-                    sctx = _s.SSLContext(_s.PROTOCOL_TLS_SERVER)
-                    sctx.load_cert_chain(sc, sk)
-                    subd.socket = sctx.wrap_socket(subd.socket, server_side=True)
-                    sscheme = "https"
-            threading.Thread(target=subd.serve_forever, daemon=True).start()
-            print(f"subscription on {sscheme}://{sdom or '0.0.0.0'}:{sub_port}/{sub_token()}")
-        except OSError as e:
-            print(f"订阅端口 {sub_port} 启动失败: {e}", file=sys.stderr)
+        SUB_STATE["port"] = sub_port
+        supervise("subscription", sub_serve_forever, sub_port)
 
     httpd = PanelHTTPServer((host, port), Handler)
     scheme = "http"
@@ -3261,6 +3633,7 @@ def main():
             ctx = _ssl.SSLContext(_ssl.PROTOCOL_TLS_SERVER)
             ctx.load_cert_chain(cert, key)
             httpd.socket = ctx.wrap_socket(httpd.socket, server_side=True)
+            register_tls("panel", ctx, cert, key)
             scheme = "https"
         else:
             print(f"警告: 证书缺失 {cert}，已回退 HTTP", file=sys.stderr)

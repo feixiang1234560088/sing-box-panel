@@ -1624,6 +1624,68 @@ def register_tls(name, ctx, cert, key):
         CERT_SIG["sig"] = _cert_sig(cert, key)
 
 
+def in_use_cert_domains():
+    """当前在用的所有证书域名：面板自己的 + 各节点入站引用的"""
+    doms = set()
+    d = load_json(PANEL_CFG, {}).get("tls_domain", "")
+    if d:
+        doms.add(d)
+    try:
+        for ib in cfg().get("inbounds", []):
+            dd = _cert_domain((ib.get("tls") or {}).get("certificate_path", ""))
+            if dd:
+                doms.add(dd)
+    except Exception:
+        pass
+    return sorted(doms)
+
+
+CERT_RENEW = {"last_run": "", "last_result": "", "fails": 0}
+
+
+def cert_renew_loop():
+    """证书续期兜底。
+
+    acme.sh 自己有 cron，但它是静默的：cron 没装上、HOME 没设、
+    80 端口被占……任何一种情况都会让续期悄无声息地失败，直到证书过期
+    整套服务一起挂。这里每天主动查一次剩余天数，不足 25 天就调用
+    acme --cron 让它自己判断并续期（acme 内部有幂等判断，不会重复签发）。"""
+    time.sleep(180)
+    while True:
+        try:
+            doms = in_use_cert_domains()
+            need = [(d, cert_days_left(d)) for d in doms]
+            need = [(d, n) for d, n in need if n is not None and n < 25]
+            if need:
+                acme = find_acme()
+                if not acme:
+                    runlog(f"证书 {need[0][0]} 剩余 {need[0][1]} 天，但找不到 acme.sh", "error")
+                    CERT_RENEW["fails"] += 1
+                else:
+                    for d, n in need:
+                        runlog(f"证书 {d} 剩余 {n} 天，触发续期", "warn")
+                    c, o, e = sh(f"HOME=/root {acme} --cron --home {ACME_HOME}", 300)
+                    time.sleep(5)
+                    after = {d: cert_days_left(d) for d, _ in need}
+                    okd = [d for d, n in need if (after.get(d) or 0) > n]
+                    if okd:
+                        CERT_RENEW["fails"] = 0
+                        CERT_RENEW["last_result"] = f"已续期: {', '.join(okd)}"
+                        runlog(f"证书续期成功: {', '.join(okd)}")
+                        # 文件已换，热重载线程会在 5 分钟内自动换掉面板/订阅的证书
+                    else:
+                        CERT_RENEW["fails"] += 1
+                        CERT_RENEW["last_result"] = (e or o or "无输出")[-200:]
+                        runlog(f"证书续期未生效({CERT_RENEW['fails']} 次): "
+                               f"{CERT_RENEW['last_result']}", "error")
+            else:
+                CERT_RENEW["last_result"] = "无需续期"
+            CERT_RENEW["last_run"] = time.strftime("%m-%d %H:%M")
+        except Exception as e:
+            runlog(f"续期检查异常: {type(e).__name__}: {e}", "error")
+        time.sleep(12 * 3600)
+
+
 def cert_reload_loop():
     """证书热重载：acme 续期后就地换证书，不用重启进程。
 
@@ -1698,6 +1760,10 @@ def api_health():
     pc = load_json(PANEL_CFG, {})
     dom = pc.get("tls_domain", "")
     days = cert_days_left(dom)
+    all_certs = [{"domain": d, "days_left": cert_days_left(d)}
+                 for d in in_use_cert_domains()]
+    min_days = min([c["days_left"] for c in all_certs
+                    if c["days_left"] is not None], default=None)
     _, sb_state, _ = sh("systemctl is-active sing-box", 5)
     sb_state = sb_state.strip() or "unknown"
     sub_port = SUB_STATE.get("port") or 0
@@ -1710,24 +1776,33 @@ def api_health():
                          "last_error": st["last_error"],
                          "last_error_at": st["last_error_at"]}
 
-    problems = []
-    if not sub_ok and sub_port:
-        problems.append("订阅端口未监听")
+    # 显式分级，不靠关键词匹配 —— 加新检查时不会因为忘了改关键词而误判
+    issues = []                                   # (severity, text)
+    if sub_port and not sub_ok:
+        issues.append(("red", "订阅端口未监听"))
     if sb_state != "active":
-        problems.append(f"sing-box 状态 {sb_state}")
+        issues.append(("red", f"sing-box 状态 {sb_state}"))
     for n, t in threads.items():
         if not t["alive"]:
-            problems.append(f"线程 {n} 未运行")
-    if days is not None and days < 7:
-        problems.append(f"证书仅剩 {days} 天")
+            issues.append(("red", f"线程 {n} 未运行"))
+    for c in all_certs:
+        dl = c["days_left"]
+        if dl is None:
+            issues.append(("yellow", f"证书 {c['domain']} 无法读取"))
+        elif dl < 0:
+            issues.append(("red", f"证书 {c['domain']} 已过期 {-dl} 天"))
+        elif dl < 7:
+            issues.append(("red", f"证书 {c['domain']} 仅剩 {dl} 天"))
+        elif dl < 15:
+            issues.append(("yellow", f"证书 {c['domain']} 剩余 {dl} 天"))
+    if CERT_RENEW["fails"] >= 2:
+        issues.append(("red", f"证书续期连续失败 {CERT_RENEW['fails']} 次"))
+    if CERT_SIG["fails"] >= 2:
+        issues.append(("yellow", f"证书热重载失败 {CERT_SIG['fails']} 次"))
 
-    if problems:
-        level = "red" if any(k in " ".join(problems)
-                             for k in ("订阅端口", "未运行", "sing-box")) else "yellow"
-    elif days is not None and days < 15:
-        level, problems = "yellow", [f"证书剩余 {days} 天"]
-    else:
-        level = "green"
+    problems = [t for _, t in issues]
+    level = ("red" if any(sev == "red" for sev, _ in issues)
+             else "yellow" if issues else "green")
 
     return {
         "level": level,
@@ -1738,10 +1813,14 @@ def api_health():
         "subscription": {"port": sub_port, "scheme": SUB_STATE.get("scheme", "http"),
                          "listening": sub_ok},
         "singbox": {"state": sb_state, "inbounds": len(cfg().get("inbounds", []))},
-        "cert": {"domain": dom, "days_left": days,
+        "cert": {"domain": dom, "days_left": days, "min_days_left": min_days,
+                 "all": all_certs,
                  "hot_reload": bool(TLS_CTXS),
                  "listeners": sorted(TLS_CTXS.keys()),
-                 "reload_fails": CERT_SIG["fails"]},
+                 "reload_fails": CERT_SIG["fails"],
+                 "renew": {"last_run": CERT_RENEW["last_run"],
+                           "last_result": CERT_RENEW["last_result"],
+                           "fails": CERT_RENEW["fails"]}},
         "heartbeat": {
             "panel_ago": int(time.time() - HEARTBEAT["panel"]) if HEARTBEAT["panel"] else None,
             "sub_ago": int(time.time() - HEARTBEAT["sub"]) if HEARTBEAT["sub"] else None,
@@ -3615,6 +3694,7 @@ def main():
     supervise("watchdog", watchdog_loop, host, port, _wd_tls)
     supervise("sub_watchdog", sub_watchdog_loop)
     supervise("cert_reload", cert_reload_loop)
+    supervise("cert_renew", cert_renew_loop)
 
     # 订阅服务与面板同进程（省一个 Python 解释器约 20MB），由 supervisor 看着
     sub_port = int(pc.get("sub_port", 8080))

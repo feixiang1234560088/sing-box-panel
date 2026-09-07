@@ -146,6 +146,32 @@ EOF
     ok "已应用 BBR + 网络调优"
 }
 
+show_sysctl() {
+    echo
+    echo -e "  ${BOLD}当前生效值${NC}"
+    local keys=(
+        net.ipv4.tcp_congestion_control
+        net.core.default_qdisc
+        net.ipv4.tcp_slow_start_after_idle
+        net.ipv4.tcp_notsent_lowat
+        net.ipv4.tcp_fastopen
+        net.ipv4.tcp_mtu_probing
+        net.core.rmem_max
+        net.ipv4.udp_rmem_min
+    )
+    local k v
+    for k in "${keys[@]}"; do
+        v=$(sysctl -n "$k" 2>/dev/null || echo "—")
+        printf "    %-38s %s\n" "$k" "$v"
+    done
+    echo
+    if [[ "$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)" == "bbr" ]]; then
+        ok "BBR 已启用"
+    else
+        warn "BBR 未启用，内核可能不支持（需 4.9+）"
+    fi
+}
+
 # ─────────────────────────────────────────────
 # 快捷命令 s
 # ─────────────────────────────────────────────
@@ -1037,6 +1063,7 @@ main_menu() {
   6) 重启 sing-box
   7) 查看日志
   8) 更新脚本与面板 (从 GitHub)
+  t) 网络调优 (重新应用 BBR + sysctl)
   c) 磁盘清理
   ─────────────────────────
   9) 完全卸载 sing-box
@@ -1051,6 +1078,7 @@ EOF
             5) do_upgrade ;;
             6) systemctl restart sing-box && ok "已重启" ;;
             7) journalctl -u sing-box -n 50 --no-pager ;;
+            t|T) tune_sysctl; show_sysctl ;;
             8) update_self ;;
             c|C) clean_disk ;;
             9) do_uninstall ;;

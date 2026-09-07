@@ -691,6 +691,7 @@ def apply_config(new_cfg):
         return False, (e or o or "配置校验失败")
     # 先清掉 systemd 的启动失败计数，否则短时间内多次重启会撞上
     # StartLimitBurst（默认 10 秒 5 次），单元被打成 failed 后不再自动拉起
+    cache_bust()                               # 配置变了，服务状态和证书清单都要重算
     sh("systemctl reset-failed sing-box")
     sh("systemctl restart sing-box")
     if not _wait_active("sing-box"):
@@ -1670,6 +1671,7 @@ def cert_renew_loop():
                     okd = [d for d, n in need if (after.get(d) or 0) > n]
                     if okd:
                         CERT_RENEW["fails"] = 0
+                        cache_bust("certs")
                         CERT_RENEW["last_result"] = f"已续期: {', '.join(okd)}"
                         runlog(f"证书续期成功: {', '.join(okd)}")
                         # 文件已换，热重载线程会在 5 分钟内自动换掉面板/订阅的证书
@@ -1721,9 +1723,32 @@ def cert_reload_loop():
 
         CERT_SIG["sig"] = sig
         CERT_SIG["fails"] = 0
+        cache_bust("certs")                    # 证书换了，天数缓存立刻失效
         d = cert_days_left(load_json(PANEL_CFG, {}).get("tls_domain", ""))
         runlog(f"证书已热重载，{ok} 个监听器生效"
                + (f"，新证书剩余 {d} 天" if d is not None else ""))
+
+
+_TTL_CACHE = {}
+
+
+def cached(key, ttl, fn):
+    """带 TTL 的结果缓存。健康接口每 60 秒被轮询一次，
+    证书天数、服务状态这些都不需要每次都真去算 —— 以前每次调用要拉起
+    5 个子进程，一天 7000 多次，在小内存 VPS 上是纯浪费。"""
+    now = time.time()
+    e = _TTL_CACHE.get(key)
+    if e and now - e[0] < ttl:
+        return e[1]
+    v = fn()
+    _TTL_CACHE[key] = (now, v)
+    return v
+
+
+def cache_bust(prefix=""):
+    """证书换了、配置改了之后主动让缓存失效"""
+    for k in [k for k in _TTL_CACHE if not prefix or k.startswith(prefix)]:
+        _TTL_CACHE.pop(k, None)
 
 
 def cert_days_left(dom):
@@ -1756,16 +1781,19 @@ def proc_rss_mb():
 
 
 def api_health():
-    """一次性回答『现在各子系统是否正常』。免鉴权，不含任何敏感信息。"""
+    """一次性回答『现在各子系统是否正常』。免鉴权，不含任何敏感信息。
+
+    昂贵的部分都走缓存：证书天数一天最多变一次，服务状态也不需要秒级精度。
+    端口探测和线程状态是内存操作，不缓存。"""
     pc = load_json(PANEL_CFG, {})
     dom = pc.get("tls_domain", "")
-    days = cert_days_left(dom)
-    all_certs = [{"domain": d, "days_left": cert_days_left(d)}
-                 for d in in_use_cert_domains()]
+    all_certs = cached("certs", 3600, lambda: [
+        {"domain": d, "days_left": cert_days_left(d)} for d in in_use_cert_domains()])
+    days = next((c["days_left"] for c in all_certs if c["domain"] == dom), None)
     min_days = min([c["days_left"] for c in all_certs
                     if c["days_left"] is not None], default=None)
-    _, sb_state, _ = sh("systemctl is-active sing-box", 5)
-    sb_state = sb_state.strip() or "unknown"
+    sb_state = cached("sb_state", 10,
+                      lambda: (sh("systemctl is-active sing-box", 5)[1].strip() or "unknown"))
     sub_port = SUB_STATE.get("port") or 0
     sub_ok = bool(sub_port) and port_alive("127.0.0.1", sub_port, 3)
 

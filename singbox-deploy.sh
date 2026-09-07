@@ -129,6 +129,18 @@ net.ipv4.tcp_mtu_probing = 1
 net.core.somaxconn = 4096
 net.core.netdev_max_backlog = 5000
 net.ipv4.tcp_max_syn_backlog = 8192
+
+# 空闲后不重置拥塞窗口。代理的连接常有间歇，默认行为会让每次恢复
+# 传输都从慢启动重来一遍，跨境高延迟链路上这一下就是几百毫秒
+net.ipv4.tcp_slow_start_after_idle = 0
+
+# 限制本机发送队列里未发出的数据量，降低本地排队延迟（bufferbloat）
+# 不影响吞吐，但能明显改善交互式请求的响应
+net.ipv4.tcp_notsent_lowat = 16384
+
+# UDP 单连接最小收发缓冲。Hysteria2/TUIC 走 QUIC，缓冲太小会丢包重传
+net.ipv4.udp_rmem_min = 8192
+net.ipv4.udp_wmem_min = 8192
 EOF
     sysctl --system >/dev/null 2>&1
     ok "已应用 BBR + 网络调优"

@@ -479,6 +479,14 @@ def runlog(msg, level="info"):
         print(f"[{level}] {msg}", file=sys.stderr)
 
 
+def _swallow(fn, *args):
+    """跑一个可能永远不返回、也可能抛错的收尾动作，调用方不关心结果。"""
+    try:
+        fn(*args)
+    except Exception:
+        pass
+
+
 def supervise(name, fn, *args, oneshot=False):
     """启动一个受监管的常驻线程。
 
@@ -599,14 +607,21 @@ def sub_watchdog_loop():
         if fails < 2:
             continue
         fails = 0
-        # 先把旧监听器关掉，让 supervisor 的重启循环接手
+        # 先把旧监听器关掉，让 supervisor 的重启循环接手。
+        # 注意 shutdown() 是**无限期**等待 serve_forever 退出 —— 服务真卡死时它
+        # 永远等不到，会把看门狗自己一起拖死（曾经就这么静默瘫了一整天）。
+        # 所以：先 force_stop 打断 accept，shutdown 丢到临时线程里且不等它。
         srv = SUB_STATE.get("server")
         if srv is not None:
+            runlog("正在强制关闭旧订阅监听器", "warn")
             try:
-                srv.shutdown()
+                srv.force_stop()
             except Exception:
                 pass
-        # supervisor 线程若已整体退出，这里补一次启动
+            threading.Thread(target=lambda: _swallow(srv.shutdown),
+                             daemon=True).start()
+        # 给 supervisor 一点时间走完重启循环，再判断要不要补一刀
+        time.sleep(15)
         st = SUPERVISED.get("subscription") or {}
         if not st.get("alive"):
             runlog("订阅监管线程已不在，重新拉起", "warn")
@@ -3169,6 +3184,46 @@ class PanelHTTPServer(ThreadingHTTPServer):
     daemon_threads = True
     request_queue_size = 128      # 默认只有 5，堆积时会直接拒绝连接
     allow_reuse_address = True
+    tls_ctx = None                # 由 use_tls() 挂上
+
+    def use_tls(self, ctx):
+        """挂 TLS —— 但绝不包装监听套接字。
+
+        `srv.socket = ctx.wrap_socket(srv.socket, server_side=True)` 是个陷阱：
+        SSLSocket.accept() 会在 accept 循环里**同步完成 TLS 握手**，只要有一个
+        客户端连上后不发 ClientHello（端口扫描器、半开的移动网络连接都会），
+        serve_forever 就永久卡在那里；后续连接堆满内核 accept 队列之后，
+        端口对外表现为「不监听」，而线程本身还活着 —— 外部完全看不出是死是活。
+        这里改成 accept 立刻返回明文 socket，握手放到每连接的工作线程里做。"""
+        self.tls_ctx = ctx
+
+    def get_request(self):
+        sock, addr = self.socket.accept()
+        sock.settimeout(30)       # 握手 / 首行 / keep-alive 空闲统一 30s 上限
+        return sock, addr
+
+    def process_request_thread(self, request, client_address):
+        try:
+            if self.tls_ctx is not None:
+                request = self.tls_ctx.wrap_socket(request, server_side=True)
+            self.finish_request(request, client_address)
+        except Exception:
+            pass                  # 握手失败 / 明文连 https 端口，静默丢弃
+        finally:
+            self.shutdown_request(request)
+
+    def force_stop(self):
+        """打断监听套接字，让任何卡在 accept 的 serve_forever 立即抛错退出。
+        给看门狗兜底用 —— shutdown() 是无限期等待，卡住的服务它叫不醒。"""
+        import socket as _sk
+        try:
+            self.socket.shutdown(_sk.SHUT_RDWR)
+        except Exception:
+            pass
+        try:
+            self.socket.close()
+        except Exception:
+            pass
 
 
 class QuietMixin:
@@ -3680,7 +3735,7 @@ def sub_serve_forever(sub_port):
             import ssl as _s
             ctx = _s.SSLContext(_s.PROTOCOL_TLS_SERVER)
             ctx.load_cert_chain(sc, sk)
-            srv.socket = ctx.wrap_socket(srv.socket, server_side=True)
+            srv.use_tls(ctx)
             register_tls("subscription", ctx, sc, sk)   # 交给 cert_reload_loop 热更新
             scheme = "https"
     SUB_STATE.update(scheme=scheme, listening=True, server=srv)
@@ -3740,7 +3795,7 @@ def main():
             import ssl as _ssl
             ctx = _ssl.SSLContext(_ssl.PROTOCOL_TLS_SERVER)
             ctx.load_cert_chain(cert, key)
-            httpd.socket = ctx.wrap_socket(httpd.socket, server_side=True)
+            httpd.use_tls(ctx)
             register_tls("panel", ctx, cert, key)
             scheme = "https"
         else:

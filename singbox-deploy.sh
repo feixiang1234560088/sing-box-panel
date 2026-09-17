@@ -820,9 +820,20 @@ setup_domain() {
 
     if [[ $need -eq 1 ]]; then
         # 80 端口检查
-        local who; who=$(ss -ltnp 2>/dev/null | grep ':80 ' | head -1)
+        # 被 nginx 等常见 Web 服务占用时：签发前停、签发后启（钩子写入 acme 配置，续期同样生效）
+        local who unit="" hooks=()
+        who=$(ss -ltnp 2>/dev/null | grep -E ':80\s' | head -1)
         if [[ -n "$who" && "$who" != *sing-box* ]]; then
-            err "80 端口被占用，请先停止:"; echo "  $who"; return 1
+            local pname; pname=$(sed -n 's/.*users:(("\([^"]*\)".*/\1/p' <<<"$who")
+            case "$pname" in
+                nginx|apache2|httpd|caddy|haproxy|lighttpd)
+                    systemctl is-active --quiet "$pname" && unit="$pname" ;;
+            esac
+            if [[ -z "$unit" ]]; then
+                err "80 端口被未知程序占用，请先停止:"; echo "  $who"; return 1
+            fi
+            warn "80 端口由 $unit 占用，签发期间临时停止，完成后自动恢复"
+            hooks=(--pre-hook "systemctl stop $unit" --post-hook "systemctl start $unit")
         fi
         local acmebin; acmebin=$(find_acme) || acmebin=""
         if [[ -z "$acmebin" ]]; then
@@ -834,13 +845,13 @@ setup_domain() {
         systemctl stop sing-box 2>/dev/null
         HOME=/root "$acmebin" --set-default-ca --server letsencrypt >/dev/null 2>&1
         local iss rc
-        iss=$(HOME=/root "$acmebin" --issue -d "$dom" --standalone --keylength ec-256 2>&1); rc=$?
+        iss=$(HOME=/root "$acmebin" --issue -d "$dom" --standalone --keylength ec-256 "${hooks[@]}" 2>&1); rc=$?
         if [[ $rc -ne 0 ]]; then
             # 撞 Let's Encrypt 限流则自动换 ZeroSSL
             if grep -q "rateLimited" <<<"$iss"; then
                 warn "Let's Encrypt 限流，改用 ZeroSSL"
                 HOME=/root "$acmebin" --set-default-ca --server zerossl >/dev/null 2>&1
-                iss=$(HOME=/root "$acmebin" --issue -d "$dom" --standalone --keylength ec-256 2>&1); rc=$?
+                iss=$(HOME=/root "$acmebin" --issue -d "$dom" --standalone --keylength ec-256 "${hooks[@]}" 2>&1); rc=$?
             fi
         fi
         if [[ $rc -ne 0 ]]; then

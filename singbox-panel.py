@@ -185,6 +185,26 @@ def install_acme(email):
 CERT_JOB = {"running": False, "domain": "", "ok": None, "msg": "", "step": ""}
 
 
+WEB_UNITS = {"nginx": "nginx", "apache2": "apache2", "httpd": "httpd",
+             "caddy": "caddy", "haproxy": "haproxy", "lighttpd": "lighttpd"}
+
+
+def port80_holder():
+    """返回 (占用行, 可临时让路的 systemd 服务名)。
+
+    standalone 验证要独占 80 端口。占着的是常见 Web 服务时，签发前停、签发后启，
+    停顿只有几十秒；不认识的程序不擅自动它，交给用户处理。"""
+    _, who, _ = sh("ss -ltnp 2>/dev/null | grep -E ':80\\s' | head -1")
+    who = who.strip()
+    if not who or "sing-box" in who:
+        return who, ""
+    m = re.search(r'users:\(\("([^"]+)"', who)
+    unit = WEB_UNITS.get(m.group(1) if m else "", "")
+    if unit and sh(f"systemctl is-active {unit}", 5)[1].strip() != "active":
+        unit = ""                        # 不是 systemd 管的，停了也拉不起来，别碰
+    return who, unit
+
+
 def preflight_cert(domain):
     """申请前预检：DNS 是否指向本机、80 端口是否可用"""
     myip = public_ip()
@@ -196,9 +216,9 @@ def preflight_cert(domain):
         return False, (f"域名解析到 {resolved}，但本机公网 IP 是 {myip}\n"
                        f"请把 {domain} 的 A 记录指向 {myip}，等 DNS 生效后再试")
     # 80 端口本地是否被非 sing-box 占用
-    _, who, _ = sh("ss -ltnp 2>/dev/null | grep ':80 ' | head -1")
-    if who.strip() and "sing-box" not in who:
-        return False, f"80 端口被占用，请先停止:\n{who.strip()}"
+    who, unit = port80_holder()
+    if who and "sing-box" not in who and not unit:
+        return False, f"80 端口被未知程序占用，请先停止:\n{who}"
     return True, ""
 
 
@@ -251,23 +271,23 @@ def issue_cert(domain):
     sh(f"{envp} --set-default-ca --server letsencrypt", 30)
 
     # 检查 80 端口占用（standalone 验证需要）
-    c80, who, _ = sh("ss -ltnp 2>/dev/null | grep ':80 ' | head -1")
-    stopped_sb = False
-    if who.strip():
-        if "sing-box" in who:
-            sh("systemctl stop sing-box"); stopped_sb = True
-        else:
-            return False, f"80 端口被占用，请先停止该服务:\n{who.strip()}"
-    else:
-        sh("systemctl stop sing-box"); stopped_sb = True
+    who, unit = port80_holder()
+    if who and "sing-box" not in who and not unit:
+        return False, f"80 端口被未知程序占用，请先停止该服务:\n{who}"
+    sh("systemctl stop sing-box"); stopped_sb = True
+    # nginx 等让路：钩子由 acme.sh 自己执行并写进域名配置，自动续期时同样生效；
+    # 签发失败它也会跑 post-hook，不会把 nginx 晾在停止状态
+    hooks = (f' --pre-hook "systemctl stop {unit}" --post-hook "systemctl start {unit}"'
+             if unit else "")
+    issue = f"{envp} --issue -d {domain} --standalone --keylength ec-256{hooks}"
 
-    c, o, e = sh(f"{envp} --issue -d {domain} --standalone --keylength ec-256", 120)
+    c, o, e = sh(issue, 120)
     out = (o or "") + (e or "")
 
     # ② 撞 Let's Encrypt 限流 → 自动改用 ZeroSSL 重试
     if c != 0 and "rateLimited" in out:
         sh(f"{envp} --set-default-ca --server zerossl", 30)
-        c, o2, e2 = sh(f"{envp} --issue -d {domain} --standalone --keylength ec-256", 120)
+        c, o2, e2 = sh(issue, 120)
         out = (o2 or "") + (e2 or "")
         if c == 0:
             out += "\n(已自动改用 ZeroSSL 签发)"
@@ -1680,7 +1700,15 @@ def cert_renew_loop():
                 else:
                     for d, n in need:
                         runlog(f"证书 {d} 剩余 {n} 天，触发续期", "warn")
-                    c, o, e = sh(f"HOME=/root {acme} --cron --home {ACME_HOME}", 300)
+                    # 早先签的证书没记钩子，后来装的 nginx 会让它们续期失败 —— 这里兜住
+                    _, unit = port80_holder()
+                    if unit:
+                        sh(f"systemctl stop {unit}", 30)
+                    try:
+                        c, o, e = sh(f"HOME=/root {acme} --cron --home {ACME_HOME}", 300)
+                    finally:
+                        if unit:
+                            sh(f"systemctl start {unit}", 30)
                     time.sleep(5)
                     after = {d: cert_days_left(d) for d, _ in need}
                     okd = [d for d, n in need if (after.get(d) or 0) > n]

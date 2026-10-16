@@ -971,6 +971,7 @@ EOF
             6) systemctl restart singbox-panel && ok "已重启" ;;
             7) systemctl disable --now singbox-panel >/dev/null 2>&1
                rm -f /etc/systemd/system/singbox-panel.service "$PANEL_PY"
+               clean_acct_chains
                systemctl daemon-reload; ok "已卸载" ;;
             0) return 0 ;;
             *) err "无效选择" ;;
@@ -1001,6 +1002,19 @@ clean_disk() {
     fi
 }
 
+# 面板流量统计用的计数链（只计数、不拦截），卸载时一并删掉
+clean_acct_chains() {
+    local ipt ch hook
+    for ipt in iptables ip6tables; do
+        command -v "$ipt" >/dev/null 2>&1 || continue
+        for pair in SBP_IN:INPUT SBP_OUT:OUTPUT; do
+            ch=${pair%%:*}; hook=${pair##*:}
+            while "$ipt" -w -D "$hook" -j "$ch" 2>/dev/null; do :; done
+            "$ipt" -w -F "$ch" 2>/dev/null; "$ipt" -w -X "$ch" 2>/dev/null
+        done
+    done
+}
+
 do_uninstall() {
     title "完全卸载"
     echo "  将删除: 服务 / 程序 / 配置 / 节点 / 证书 / 快捷命令 / BBR调优 / 端口跳跃规则"
@@ -1015,6 +1029,7 @@ do_uninstall() {
         rm -f "/etc/systemd/system/${s}.service"
     done
     systemctl daemon-reload; systemctl reset-failed >/dev/null 2>&1
+    clean_acct_chains
 
     local n=0 line
     while :; do

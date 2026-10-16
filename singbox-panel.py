@@ -706,13 +706,26 @@ def _wait_active(unit, timeout=12):
 
 
 def apply_config(new_cfg):
-    """校验并写入，失败自动回滚"""
+    """校验并写入，失败自动回滚。
+
+    写入前统一做两件事：把用户表同步进各节点的 users，确保流量统计用的
+    Clash API 存在。放在这里而不是各个接口里，任何改配置的路径都不会漏掉。"""
     try:
         n = prune_orphan_rules(new_cfg)
         if n:
             print(f"[config] 清理 {n} 条孤儿/重复路由规则", file=sys.stderr)
     except Exception:
         pass
+    managed = sync_users(new_cfg)
+    ensure_clash_api(new_cfg)
+    okk, msg = _apply_config(new_cfg)
+    if okk:
+        _save_managed(managed)                 # 只有真正生效才记账，回滚时保持旧记录
+    # sing-box 的报错带终端颜色码，显示到网页上是乱码
+    return okk, re.sub(r"\x1b\[[0-9;]*m", "", msg) if isinstance(msg, str) else msg
+
+
+def _apply_config(new_cfg):
     old = None
     if os.path.exists(SB_CONF):
         with open(SB_CONF) as f:
@@ -1943,12 +1956,24 @@ def api_inbounds():
     for r in c.get("route", {}).get("rules", []):
         for t in (r.get("inbound") or []):
             binds[t] = r.get("outbound")
+    d, now = load_users(), time.time()
     for ib in c.get("inbounds", []):
         t = ib.get("tag")
+        if t.endswith("-ss") and ib.get("listen") == "127.0.0.1":
+            continue                      # ShadowTLS 的内部入站，不单独展示
         info = m.get(t, {})
+        p = node_proto(ib, m)
+        tot = STATS["totals"].get(t, {})
+        lv = STATS["live"].get(t, {})
         out.append({"tag": t, "type": ib.get("type"), "port": ib.get("listen_port"),
-                    "name": info.get("name", t), "uri": info.get("uri", ""),
-                    "bind": binds.get(t, "direct")})
+                    "proto": p, "name": info.get("name", t), "uri": info.get("uri", ""),
+                    "bind": binds.get(t, "direct"),
+                    "multi": p in MULTI_USER and bool(ib.get("users")),
+                    "users": [u["name"] for u in d["users"] if t in (u.get("inbounds") or [])],
+                    "active_users": sum(1 for u in d["users"]
+                                        if t in (u.get("inbounds") or []) and user_active(u, now)),
+                    "up": tot.get("up", 0), "down": tot.get("down", 0),
+                    "conns": lv.get("conns", 0)})
     return out
 
 
@@ -1989,8 +2014,12 @@ def api_add_inbound(body):
     c.setdefault("inbounds", []).append(ib)
     if extra:
         c["inbounds"].append(extra)
+    old_users = load_json(USERS_FILE, None)
+    set_node_users(tag, body.get("users"))
     okk, msg = apply_config(c)
     if not okk:
+        if old_users is not None:
+            save_json(USERS_FILE, old_users)
         return False, msg
     m = meta()
     m[tag] = {"name": f.get("name", tag), "uri": uri, "proto": proto,
@@ -2202,8 +2231,12 @@ def api_edit_inbound(tag, body):
         newins.append(extra)
     c["inbounds"] = newins
 
+    old_users = load_json(USERS_FILE, None)
+    set_node_users(tag, body.get("users"))
     okk, msg = apply_config(c)
     if not okk:
+        if old_users is not None:
+            save_json(USERS_FILE, old_users)
         return False, msg
     info.update({"name": f.get("name", tag), "uri": uri, "proto": proto,
                  "fields": f, "edited": time.strftime("%F %T")})
@@ -2226,6 +2259,8 @@ def api_del_inbound(tag):
     m = meta()
     m.pop(tag, None)
     save_json(META_FILE, m)
+    drop_node_from_users(tag)
+    STATS["totals"].pop(tag, None)
     rebuild_sub()
     return True, "已删除"
 
@@ -2473,6 +2508,944 @@ def api_test_outbound(tag):
 # ════════════════════════════════════════════
 # HTTP
 # ════════════════════════════════════════════
+# ════════════════════════════════════════════
+# 多用户（参照 s-ui 的 Clients）
+#
+# 用户表存在 users.json，节点配置里的 users 由 sync_users 每次应用配置时
+# 重新生成：节点原有的用户（建节点时的那一个，也就是现有订阅）原样保留，
+# 面板用户追加在后面。面板追加过哪些用户记在 managed 里，下次先摘掉再按
+# 当前用户表重建 —— 这样删除、停用、到期都能干净地移除，又不碰手写的用户。
+# ════════════════════════════════════════════
+USERS_FILE = f"{SB_ETC}/users.json"
+STATS_FILE = f"{SB_ETC}/stats.json"
+USER_NAME_RE = re.compile(r"^[A-Za-z0-9_.-]{1,32}$")
+
+# 支持多用户的协议 -> sing-box 用户对象
+# Shadowsocks 2022 多用户要求客户端带「服务端密钥:用户密钥」，开启后原有的单密码
+# 链接立即失效；ShadowTLS / Snell 共用一个密钥 —— 这三种不做多用户，避免破坏现有订阅
+MULTI_USER = {
+    "hysteria2": lambda u: {"name": u["name"], "password": u["password"]},
+    "vless":     lambda u: {"name": u["name"], "uuid": u["uuid"]},
+    "vless-tls": lambda u: {"name": u["name"], "uuid": u["uuid"]},
+    "trojan":    lambda u: {"name": u["name"], "password": u["password"]},
+    "anytls":    lambda u: {"name": u["name"], "password": u["password"]},
+    "tuic":      lambda u: {"name": u["name"], "uuid": u["uuid"], "password": u["password"]},
+    "vmess":     lambda u: {"name": u["name"], "uuid": u["uuid"], "alterId": 0},
+    "hysteria":  lambda u: {"name": u["name"], "auth_str": u["password"]},
+    "naive":     lambda u: {"username": u["name"], "password": u["password"]},
+    "socks":     lambda u: {"username": u["name"], "password": u["password"]},
+    "mixed":     lambda u: {"username": u["name"], "password": u["password"]},
+    "http":      lambda u: {"username": u["name"], "password": u["password"]},
+}
+
+
+def load_users():
+    d = load_json(USERS_FILE, {})
+    if not isinstance(d, dict):
+        d = {}
+    d.setdefault("users", [])
+    d.setdefault("managed", {})
+    return d
+
+
+def save_users(d):
+    save_json(USERS_FILE, d)
+
+
+def _uid(x):
+    return x.get("name") or x.get("username") or ""
+
+
+def user_active(u, now=None):
+    now = now or time.time()
+    exp = int(u.get("expiry") or 0)
+    return bool(u.get("enable", True)) and (exp == 0 or exp > now)
+
+
+def node_proto(ib, m=None):
+    m = meta() if m is None else m
+    return (m.get(ib.get("tag"), {}) or {}).get("proto") or guess_proto(ib)
+
+
+def sync_users(c):
+    """把用户表写进各节点。返回新的 managed（应用成功后再保存）"""
+    data = load_users()
+    m, now = meta(), time.time()
+    old = data.get("managed", {})
+    new = {}
+    for ib in c.get("inbounds", []):
+        tag = ib.get("tag")
+        drop = set(old.get(tag, []))
+        cur = ib.get("users") or []
+        base = [x for x in cur if _uid(x) not in drop] if drop else list(cur)
+        mk = MULTI_USER.get(node_proto(ib, m))
+        add = []
+        # 节点本身没有认证用户（如无密码的 SOCKS）时不加：一加就变成必须认证，原链接失效
+        if mk and base:
+            flow = base[0].get("flow")
+            taken = {_uid(x) for x in base}
+            for u in data["users"]:
+                if tag in (u.get("inbounds") or []) and user_active(u, now) \
+                        and u["name"] not in taken:
+                    o = mk(u)
+                    if flow:
+                        o["flow"] = flow
+                    add.append(o)
+        if drop or add:
+            ib["users"] = base + add
+        if add:
+            new[tag] = [_uid(o) for o in add]
+    return new
+
+
+def _save_managed(managed):
+    d = load_users()
+    if d.get("managed") != managed:
+        d["managed"] = managed
+        save_users(d)
+
+
+def swap_cred(uri, proto, u):
+    """把节点分享链接里的凭据换成某个用户的"""
+    if proto == "vmess":
+        vm = json.loads(base64.b64decode(uri[8:] + "==").decode())
+        vm["id"] = u["uuid"]
+        return "vmess://" + b64(json.dumps(vm, ensure_ascii=False))
+    if proto == "hysteria":
+        return _uq(uri, auth=u["password"])
+    if proto in ("vless", "vless-tls"):
+        cred = u["uuid"]
+    elif proto == "tuic":
+        cred = f"{u['uuid']}:{uenc(u['password'])}"
+    elif proto in ("naive", "http"):
+        cred = f"{uenc(u['name'])}:{uenc(u['password'])}"
+    elif proto in ("socks", "mixed"):
+        cred = b64(f"{u['name']}:{u['password']}")
+    else:
+        cred = uenc(u["password"])
+    return re.sub(r"^([a-z0-9+]+://)[^@/]*@", lambda mm: mm.group(1) + cred + "@", uri, count=1)
+
+
+def user_links(u, c=None, m=None):
+    c, m = c or cfg(), meta() if m is None else m
+    out = []
+    for ib in c.get("inbounds", []):
+        tag = ib.get("tag")
+        if tag not in (u.get("inbounds") or []):
+            continue
+        info = m.get(tag, {})
+        proto = node_proto(ib, m)
+        uri = info.get("uri", "")
+        if not uri or proto not in MULTI_USER or not ib.get("users"):
+            continue
+        try:
+            out.append({"tag": tag, "name": info.get("name", tag), "uri": swap_cred(uri, proto, u)})
+        except Exception:
+            pass
+    return out
+
+
+def sub_base_url():
+    pc = load_json(PANEL_CFG, {})
+    dom = pc.get("tls_domain", "")
+    sch = "https" if dom else "http"
+    return f"{sch}://{dom or public_ip()}:{pc.get('sub_port', 8080)}/"
+
+
+def _new_user(name, f):
+    return {"name": name, "enable": bool(f.get("enable", True)),
+            "group": str(f.get("group") or "")[:32], "remark": str(f.get("remark") or "")[:200],
+            "expiry": int(f.get("expiry") or 0), "inbounds": list(f.get("inbounds") or []),
+            "uuid": f.get("uuid") or gen_uuid(),
+            "password": f.get("password") or secrets.token_urlsafe(12),
+            "sub": secrets.token_hex(16), "created": int(time.time())}
+
+
+def _commit_users(d):
+    """保存用户表并应用到 sing-box；失败时恢复原表"""
+    old = load_json(USERS_FILE, None)
+    save_users(d)
+    okk, msg = apply_config(cfg())
+    if not okk:
+        if old is None:
+            try:
+                os.remove(USERS_FILE)
+            except OSError:
+                pass
+        else:
+            save_json(USERS_FILE, old)
+    return okk, msg
+
+
+def _clean_inbounds(tags):
+    exist = {i.get("tag") for i in cfg().get("inbounds", [])}
+    return [t for t in (tags or []) if t in exist]
+
+
+def api_users():
+    c, m = cfg(), meta()
+    d, now = load_users(), time.time()
+    nodes = []
+    for ib in c.get("inbounds", []):
+        t = ib.get("tag")
+        if t.endswith("-ss") and ib.get("listen") == "127.0.0.1":
+            continue                      # ShadowTLS 的内部入站
+        p = node_proto(ib, m)
+        nodes.append({"tag": t, "name": m.get(t, {}).get("name", t), "proto": p,
+                      "multi": p in MULTI_USER and bool(ib.get("users"))})
+    users = []
+    for u in d["users"]:
+        exp = int(u.get("expiry") or 0)
+        users.append(dict(u, active=user_active(u, now), expired=bool(exp and exp <= now)))
+    return {"users": users, "nodes": nodes, "sub_base": sub_base_url()}
+
+
+def api_user_save(name, f, create):
+    d = load_users()
+    nn = (f.get("name") or "").strip()
+    if not USER_NAME_RE.match(nn):
+        return False, "用户名需为 1-32 位字母、数字、. _ -"
+    names = {u["name"] for u in d["users"]}
+    if create:
+        if nn in names:
+            return False, "用户名已存在"
+        u = _new_user(nn, f)
+        u["inbounds"] = _clean_inbounds(u["inbounds"])
+        d["users"].append(u)
+    else:
+        u = next((x for x in d["users"] if x["name"] == name), None)
+        if not u:
+            return False, "用户不存在"
+        if nn != name and nn in names:
+            return False, "用户名已存在"
+        u.update(name=nn, enable=bool(f.get("enable", True)),
+                 group=str(f.get("group") or "")[:32], remark=str(f.get("remark") or "")[:200],
+                 expiry=int(f.get("expiry") or 0), inbounds=_clean_inbounds(f.get("inbounds")))
+        if f.get("uuid"):
+            u["uuid"] = f["uuid"].strip()
+        if f.get("password"):
+            u["password"] = f["password"].strip()
+    if not re.match(r"^[0-9a-fA-F-]{36}$", u["uuid"]):
+        return False, "UUID 格式无效"
+    okk, msg = _commit_users(d)
+    return (True, "已保存") if okk else (False, msg)
+
+
+def api_users_bulk(f):
+    d = load_users()
+    try:
+        n = max(1, min(200, int(f.get("count") or 1)))
+        start = max(0, int(f.get("start") or 1))
+    except (TypeError, ValueError):
+        return False, "数量无效"
+    prefix = (f.get("prefix") or "user").strip()
+    if not USER_NAME_RE.match(prefix + "0"):
+        return False, "前缀只能包含字母、数字、. _ -"
+    names = {u["name"] for u in d["users"]}
+    made = 0
+    for i in range(start, start + n * 3):
+        if made >= n:
+            break
+        nm = f"{prefix}{i}"
+        if nm in names or len(nm) > 32:
+            continue
+        u = _new_user(nm, f)
+        u["inbounds"] = _clean_inbounds(u["inbounds"])
+        d["users"].append(u)
+        names.add(nm)
+        made += 1
+    okk, msg = _commit_users(d)
+    return (True, f"已添加 {made} 个用户") if okk else (False, msg)
+
+
+def api_user_del(names):
+    d = load_users()
+    keep = [u for u in d["users"] if u["name"] not in set(names)]
+    if len(keep) == len(d["users"]):
+        return False, "用户不存在"
+    d["users"] = keep
+    okk, msg = _commit_users(d)
+    return (True, "已删除") if okk else (False, msg)
+
+
+def api_user_reset(name, what):
+    d = load_users()
+    u = next((x for x in d["users"] if x["name"] == name), None)
+    if not u:
+        return False, "用户不存在"
+    if what == "sub":
+        u["sub"] = secrets.token_hex(16)
+        save_users(d)                     # 订阅地址不影响 sing-box，不用重启
+        return True, "订阅地址已更换，旧地址立即失效"
+    u["uuid"], u["password"] = gen_uuid(), secrets.token_urlsafe(12)
+    okk, msg = _commit_users(d)
+    return (True, "凭据已重新生成，该用户需重新拉订阅") if okk else (False, msg)
+
+
+def set_node_users(tag, names):
+    """节点弹窗里勾选的用户 -> 写回用户表（不应用，交给调用方一起应用）"""
+    if names is None:
+        return
+    d = load_users()
+    want = set(names)
+    for u in d["users"]:
+        ins = [t for t in (u.get("inbounds") or []) if t != tag]
+        if u["name"] in want:
+            ins.append(tag)
+        u["inbounds"] = ins
+    save_users(d)
+
+
+def drop_node_from_users(tag):
+    d = load_users()
+    changed = False
+    for u in d["users"]:
+        if tag in (u.get("inbounds") or []):
+            u["inbounds"] = [t for t in u["inbounds"] if t != tag]
+            changed = True
+    if d.get("managed", {}).pop(tag, None) is not None:
+        changed = True
+    if changed:
+        save_users(d)
+
+
+def find_user_by_sub(tok):
+    if not tok:
+        return None
+    return next((u for u in load_users()["users"] if u.get("sub") == tok), None)
+
+
+USERS_SIG = {"v": None}
+
+
+def users_loop():
+    """到期检查：活跃用户集合一变（有人到期）就重新应用配置，把他从节点里摘掉"""
+    time.sleep(20)
+    # 面板升级后的第一次：配置里还没有 Clash API / 用户，补齐一次（sing-box 会重启一下）
+    try:
+        c = cfg()
+        c2 = json.loads(json.dumps(c))
+        sync_users(c2)
+        ensure_clash_api(c2)
+        if c.get("inbounds") and c2 != c:
+            with LOCK:
+                okk, msg = apply_config(cfg())
+            runlog("已补齐流量统计接口 / 用户配置" if okk else f"补齐配置失败: {msg[:120]}",
+                   "info" if okk else "error")
+    except Exception as e:
+        runlog(f"启动同步异常: {type(e).__name__}: {e}", "error")
+    while True:
+        try:
+            now = time.time()
+            sig = json.dumps(sorted((u["name"], tuple(sorted(u.get("inbounds") or [])))
+                                    for u in load_users()["users"] if user_active(u, now)))
+            if USERS_SIG["v"] is not None and sig != USERS_SIG["v"]:
+                with LOCK:
+                    okk, msg = apply_config(cfg())
+                runlog("用户状态变化（到期/启用），已同步到节点" if okk
+                       else f"用户同步失败: {msg[:120]}", "info" if okk else "error")
+            USERS_SIG["v"] = sig
+        except Exception as e:
+            runlog(f"用户检查异常: {type(e).__name__}: {e}", "error")
+        time.sleep(60)
+
+
+# ════════════════════════════════════════════
+# 流量统计：读 sing-box 的 Clash API（只监听 127.0.0.1）
+#
+# 官方 sing-box 的连接信息里只有入站标签、没有用户名，所以只能按节点统计。
+# s-ui 能按用户统计，是因为它把 sing-box 编译进了自己的程序 —— 代价就是
+# 没法自由选择 sing-box 版本。
+# ════════════════════════════════════════════
+def _free_local_port():
+    import socket as _sk
+    used = {i.get("listen_port") for i in cfg().get("inbounds", [])}
+    for _ in range(50):
+        p = 20000 + secrets.randbelow(40000)
+        if p in used:
+            continue
+        s = _sk.socket()
+        try:
+            s.bind(("127.0.0.1", p))
+            return p
+        except OSError:
+            continue
+        finally:
+            s.close()
+    return 29090
+
+
+def ensure_clash_api(c):
+    pc = load_json(PANEL_CFG, {})
+    exp = c.get("experimental") or {}
+    ca = exp.get("clash_api") or {}
+    if pc.get("stats_disabled"):
+        # 只撤掉面板自己加的那个，用户手写的不动
+        if ca.get("external_controller") == f"127.0.0.1:{pc.get('clash_port')}":
+            exp.pop("clash_api", None)
+            if exp:
+                c["experimental"] = exp
+            else:
+                c.pop("experimental", None)
+        return
+    if ca.get("external_controller"):
+        # 已经有了（可能是用户自己配的）：沿用，不覆盖
+        host, _, port = ca["external_controller"].rpartition(":")
+        if port.isdigit() and (pc.get("clash_port") != int(port) or pc.get("clash_secret") != ca.get("secret", "")):
+            pc.update(clash_port=int(port), clash_secret=ca.get("secret", ""),
+                      clash_host=host if host not in ("", "0.0.0.0", "::", "[::]") else "127.0.0.1")
+            save_json(PANEL_CFG, pc)
+        return
+    port = pc.get("clash_port") or _free_local_port()
+    sec = pc.get("clash_secret") or secrets.token_hex(16)
+    if pc.get("clash_port") != port or pc.get("clash_secret") != sec:
+        pc.update(clash_port=port, clash_secret=sec, clash_host="127.0.0.1")
+        save_json(PANEL_CFG, pc)
+    exp["clash_api"] = {"external_controller": f"127.0.0.1:{port}", "secret": sec}
+    c["experimental"] = exp
+
+
+def clash_get(path, timeout=3):
+    import urllib.request
+    pc = load_json(PANEL_CFG, {})
+    port = pc.get("clash_port")
+    if not port:
+        raise RuntimeError("Clash API 未配置")
+    req = urllib.request.Request(f"http://{pc.get('clash_host', '127.0.0.1')}:{port}{path}")
+    if pc.get("clash_secret"):
+        req.add_header("Authorization", f"Bearer {pc['clash_secret']}")
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return json.loads(r.read())
+
+
+STATS = {"ok": False, "err": "启动中", "totals": {}, "live": {}, "rate": {"up": 0, "down": 0},
+         "conns": 0, "hist": [], "last": {}, "tot_raw": None, "t": 0, "saved": 0, "primed": False}
+
+
+def _tag_of(cn):
+    t = (cn.get("metadata") or {}).get("type", "")
+    return t.split("/", 1)[1] if "/" in t else t
+
+
+def stats_poll(count_totals=True):
+    """读 Clash API：当前连接数、在线 IP、总速率。
+
+    count_totals=False（iptables 计量可用）时，这里不再累计流量，各节点速率
+    也沿用 iptables 算出的精确值 —— Clash API 漏掉短连接，只做兜底。"""
+    d = clash_get("/connections")
+    now = time.time()
+    dt = max(0.5, now - STATS["t"]) if STATS["t"] else 0
+    live, seen, last = {}, set(), STATS["last"]
+    for cn in d.get("connections") or []:
+        cid, tag = cn.get("id"), _tag_of(cn)
+        up, dn = int(cn.get("upload") or 0), int(cn.get("download") or 0)
+        pu, pd = last.get(cid, (0, 0))
+        du, dd = max(0, up - pu), max(0, dn - pd)
+        last[cid] = (up, dn)
+        seen.add(cid)
+        lv = live.setdefault(tag, {"conns": 0, "ips": set(), "du": 0, "dd": 0})
+        lv["conns"] += 1
+        ip = (cn.get("metadata") or {}).get("sourceIP")
+        if ip:
+            lv["ips"].add(ip)
+        if STATS["primed"]:               # 第一轮只建基线，避免把面板重启前的量重复记一遍
+            lv["du"] += du
+            lv["dd"] += dd
+            if count_totals:
+                t = STATS["totals"].setdefault(tag, {"up": 0, "down": 0})
+                t["up"] += du
+                t["down"] += dd
+    for cid in [k for k in last if k not in seen]:
+        del last[cid]
+    raw = (int(d.get("uploadTotal") or 0), int(d.get("downloadTotal") or 0))
+    pr = STATS["tot_raw"]
+    if pr and dt:
+        STATS["rate"] = {"up": max(0, raw[0] - pr[0]) / dt, "down": max(0, raw[1] - pr[1]) / dt}
+    STATS["tot_raw"] = raw
+    if count_totals:
+        STATS["live"] = {k: {"conns": v["conns"], "ips": len(v["ips"]),
+                             "up_rate": v["du"] / dt if dt else 0, "down_rate": v["dd"] / dt if dt else 0}
+                         for k, v in live.items()}
+    else:
+        ar = STATS.get("acct_rates") or {}
+        tags = set(live) | set(ar)
+        STATS["live"] = {k: dict({"up_rate": 0, "down_rate": 0}, **ar.get(k, {}),
+                                 conns=live.get(k, {}).get("conns", 0),
+                                 ips=len(live.get(k, {}).get("ips", ())))
+                         for k in tags}
+    STATS["conns"] = sum(v["conns"] for v in live.values())
+    STATS["hist"].append([int(now), round(STATS["rate"]["up"]), round(STATS["rate"]["down"])])
+    del STATS["hist"][:-120]
+    STATS.update(t=now, ok=True, err="", primed=True)
+
+
+# ── 精确计量：iptables 端口计数 ──
+# 轮询 Clash API 只能看到「轮询那一刻还开着」的连接，两次轮询之间开始又结束的
+# 短连接（网页请求、API 调用）会整个漏掉 —— 实测 2MB 的本地下载 0.1 秒就结束，
+# 统计到的是 0。内核按端口计数每一个包，不漏也不受 sing-box 重启影响。
+# 规则只计数、不带动作，不拦截任何流量。
+ACCT = {"ok": None, "ports": None, "prev": {}, "t": 0, "err": ""}
+ACCT_CHAINS = (("SBP_IN", "INPUT", "--dport"), ("SBP_OUT", "OUTPUT", "--sport"))
+_ACCT_RE = re.compile(r"^\s*\d+\s+(\d+)\s+.*?\b(tcp|udp)\b.*?\b(dpt|spt):(\d+)")
+
+
+def acct_ports(c):
+    out = {}
+    for ib in c.get("inbounds", []):
+        p = ib.get("listen_port")
+        if p and ib.get("listen") not in ("127.0.0.1", "::1", "localhost"):
+            out[int(p)] = ib.get("tag")
+    return out
+
+
+def acct_tools():
+    return [t for t in ("iptables", "ip6tables") if sh(f"command -v {t}", 5)[0] == 0]
+
+
+def acct_read(tools):
+    """返回 {端口: [入字节, 出字节]}；一条计数链都读不到时返回 None"""
+    res, readable = {}, False
+    for ipt in tools:
+        for ch, _, _ in ACCT_CHAINS:
+            c, o, _ = sh(f"{ipt} -w -nvxL {ch} 2>/dev/null", 10)
+            if c != 0 or f"Chain {ch}" not in o:
+                continue
+            readable = True
+            for ln in o.splitlines():
+                mm = _ACCT_RE.match(ln)
+                if mm:
+                    r = res.setdefault(int(mm.group(4)), [0, 0])
+                    r[0 if ch == "SBP_IN" else 1] += int(mm.group(1))
+    return res if readable else None
+
+
+def acct_setup(tools, ports):
+    cmds = []
+    for ipt in tools:
+        for ch, hook, k in ACCT_CHAINS:
+            cmds += [f"{ipt} -w -N {ch} 2>/dev/null",
+                     f"{ipt} -w -C {hook} -j {ch} 2>/dev/null || {ipt} -w -I {hook} 1 -j {ch}",
+                     f"{ipt} -w -F {ch}"]
+            cmds += [f"{ipt} -w -A {ch} -p {pr} {k} {p}" for p in sorted(ports) for pr in ("tcp", "udp")]
+    c, _, e = sh("; ".join(cmds) + "; true", 30)
+    return c == 0
+
+
+def acct_credit(cur, ports, dt):
+    """把计数器增量记到对应节点上，返回各节点的实时速率"""
+    rates = {}
+    for port, (bi, bo) in cur.items():
+        tag = ports.get(port)
+        if not tag:
+            continue
+        pi, po = ACCT["prev"].get(port, (0, 0))
+        di = bi - pi if bi >= pi else bi          # 计数器被清零过：本次读数就是增量
+        do = bo - po if bo >= po else bo
+        t = STATS["totals"].setdefault(tag, {"up": 0, "down": 0})
+        t["up"] += di                              # 进服务器 = 用户上传
+        t["down"] += do                            # 出服务器 = 用户下载
+        if dt:
+            rates[tag] = {"up_rate": di / dt, "down_rate": do / dt}
+    ACCT["prev"] = {p: tuple(v) for p, v in cur.items()}
+    return rates
+
+
+def acct_poll():
+    tools = ACCT.get("tools")
+    if tools is None:
+        tools = ACCT["tools"] = acct_tools()
+    if not tools:
+        ACCT.update(ok=False, err="系统没有 iptables")
+        return None
+    ports = acct_ports(cfg())
+    now = time.time()
+    dt = now - ACCT["t"] if ACCT["t"] else 0
+    if ports != ACCT["ports"]:
+        if ACCT["ports"]:
+            old = acct_read(tools)
+            if old is not None:
+                acct_credit(old, ACCT["ports"], 0)            # 换规则前先把旧计数记账
+        acct_setup(tools, ports)
+        # 命令串末尾是 `; true`，退出码说明不了什么 —— 以能否读到计数链为准
+        if acct_read(tools) is None:
+            ACCT.update(ok=False, ports=None, err="iptables 计数链创建失败（可能只有 nftables 或权限不足）")
+            return None
+        ACCT.update(ports=ports, prev={}, t=now)
+        return {}
+    # ufw / firewalld 重载时可能把跳转规则冲掉，计数链还在但不再有包经过 —— 定期补回
+    ACCT["n"] = ACCT.get("n", 0) + 1
+    if ACCT["n"] % 20 == 0:
+        sh("; ".join(f"{ipt} -w -C {hook} -j {ch} 2>/dev/null || {ipt} -w -I {hook} 1 -j {ch}"
+                     for ipt in tools for ch, hook, _ in ACCT_CHAINS) + "; true", 15)
+    cur = acct_read(tools)
+    if cur is None:
+        # 计数链被外部删掉了（如 iptables -F）：下一轮重建
+        ACCT.update(ok=False, ports=None, err="计数链丢失，正在重建")
+        return None
+    rates = acct_credit(cur, ports, dt)
+    ACCT.update(t=now, ok=True, err="")
+    return rates
+
+
+def stats_loop():
+    STATS["totals"] = (load_json(STATS_FILE, {}) or {}).get("totals", {})
+    time.sleep(8)
+    n = 0
+    while True:
+        if load_json(PANEL_CFG, {}).get("stats_disabled"):
+            STATS.update(ok=False, err="流量统计已关闭")
+            time.sleep(30)
+            continue
+        # 实时连接数 / 在线 IP / 总速率：Clash API
+        try:
+            stats_poll(count_totals=not ACCT.get("ok"))
+        except Exception as e:
+            STATS.update(ok=False, err=f"{type(e).__name__}: {e}"[:160], primed=False,
+                         t=0, tot_raw=None)
+            STATS["last"].clear()
+        # 累计流量：iptables 精确计数，每 9 秒读一次
+        if n % 3 == 0:
+            try:
+                rates = acct_poll()
+                if rates is not None:
+                    STATS["acct_rates"] = rates
+            except Exception as e:
+                ACCT.update(ok=False, err=f"{type(e).__name__}: {e}"[:160])
+        n += 1
+        if time.time() - STATS["saved"] > 30:
+            save_json(STATS_FILE, {"totals": STATS["totals"]})
+            STATS["saved"] = time.time()
+        time.sleep(3)
+
+
+# ════════════════════════════════════════════
+# 系统监控（仪表盘）：全部读 /proc，不起子进程
+# ════════════════════════════════════════════
+PROC = "/proc"
+SYSMON = {"cpu": None, "net": None, "t": 0, "hist": [], "cur": {}}
+
+
+def _rd(p):
+    try:
+        with open(p) as f:
+            return f.read()
+    except OSError:
+        return ""
+
+
+def _cpu_times():
+    ln = _rd(f"{PROC}/stat").split("\n", 1)[0].split()
+    if len(ln) < 5 or ln[0] != "cpu":
+        return None
+    v = [int(x) for x in ln[1:]]
+    idle = v[3] + (v[4] if len(v) > 4 else 0)
+    return sum(v), idle
+
+
+def _net_bytes():
+    rx = tx = 0
+    for ln in _rd(f"{PROC}/net/dev").splitlines()[2:]:
+        name, _, rest = ln.partition(":")
+        name = name.strip()
+        if not rest or name == "lo" or name.startswith(("veth", "docker", "br-", "singtun", "tun")):
+            continue
+        f = rest.split()
+        if len(f) >= 9:
+            rx += int(f[0])
+            tx += int(f[8])
+    return rx, tx
+
+
+def _meminfo():
+    mi = {}
+    for ln in _rd(f"{PROC}/meminfo").splitlines():
+        k, _, v = ln.partition(":")
+        try:
+            mi[k] = int(v.split()[0]) * 1024
+        except (ValueError, IndexError):
+            pass
+    return mi
+
+
+def sys_sample():
+    now = time.time()
+    cur = {}
+    ct = _cpu_times()
+    if ct and SYSMON["cpu"]:
+        dt_, di = ct[0] - SYSMON["cpu"][0], ct[1] - SYSMON["cpu"][1]
+        cur["cpu"] = round(100.0 * (dt_ - di) / dt_, 1) if dt_ > 0 else 0.0
+    SYSMON["cpu"] = ct
+    nb = _net_bytes()
+    if SYSMON["net"] and SYSMON["t"]:
+        dt = max(0.5, now - SYSMON["t"])
+        cur["rx"] = max(0, nb[0] - SYSMON["net"][0]) / dt
+        cur["tx"] = max(0, nb[1] - SYSMON["net"][1]) / dt
+    SYSMON["net"], SYSMON["t"] = nb, now
+    cur["rx_total"], cur["tx_total"] = nb
+    mi = _meminfo()
+    if mi.get("MemTotal"):
+        tot = mi["MemTotal"]
+        used = tot - mi.get("MemAvailable", mi.get("MemFree", 0))
+        cur["mem"] = {"used": used, "total": tot}
+        cur["swap"] = {"used": mi.get("SwapTotal", 0) - mi.get("SwapFree", 0),
+                       "total": mi.get("SwapTotal", 0)}
+    try:
+        st = os.statvfs("/")
+        cur["disk"] = {"used": (st.f_blocks - st.f_bfree) * st.f_frsize,
+                       "total": st.f_blocks * st.f_frsize}
+    except OSError:
+        pass
+    try:
+        cur["load"] = [round(x, 2) for x in os.getloadavg()]
+    except OSError:
+        pass
+    up = _rd(f"{PROC}/uptime").split()
+    if up:
+        cur["uptime"] = int(float(up[0]))
+    SYSMON["cur"] = cur
+    if "cpu" in cur:
+        mem_pct = round(100.0 * cur["mem"]["used"] / cur["mem"]["total"], 1) if cur.get("mem") else 0
+        SYSMON["hist"].append([int(now), cur["cpu"], mem_pct,
+                               round(cur.get("rx", 0)), round(cur.get("tx", 0))])
+        del SYSMON["hist"][:-120]
+
+
+def sys_loop():
+    while True:
+        try:
+            sys_sample()
+        except Exception as e:
+            SYSMON["cur"]["err"] = str(e)[:120]
+        time.sleep(3)
+
+
+def sys_static():
+    def _f():
+        cpu = next((ln.split(":", 1)[1].strip() for ln in _rd(f"{PROC}/cpuinfo").splitlines()
+                    if ln.lower().startswith(("model name", "hardware"))), "")
+        osr = next((ln.split("=", 1)[1].strip().strip('"') for ln in _rd("/etc/os-release").splitlines()
+                    if ln.startswith("PRETTY_NAME=")), "")
+        u = os.uname()
+        return {"host": u.nodename, "kernel": u.release, "arch": u.machine, "os": osr,
+                "cpu_model": cpu, "cores": os.cpu_count() or 0}
+    return cached("sys_static", 3600, _f)
+
+
+def sb_proc():
+    def _f():
+        _, pid, _ = sh("systemctl show -p MainPID --value sing-box", 5)
+        pid = pid.strip()
+        return int(pid) if pid.isdigit() and pid != "0" else 0
+    pid = cached("sb_pid", 15, _f)
+    if not pid:
+        return {}
+    out = {"pid": pid}
+    for ln in _rd(f"{PROC}/{pid}/status").splitlines():
+        if ln.startswith("VmRSS:"):
+            out["rss"] = int(ln.split()[1]) * 1024
+    stat = _rd(f"{PROC}/{pid}/stat")
+    up = _rd(f"{PROC}/uptime").split()
+    if stat and up:
+        try:
+            start = int(stat.rsplit(")", 1)[1].split()[19])
+            out["uptime"] = int(float(up[0]) - start / os.sysconf("SC_CLK_TCK"))
+        except (IndexError, ValueError, OSError):
+            pass
+    if not out.get("rss"):
+        cache_bust("sb_pid")              # 进程换了（重启过），下次重新取 PID
+    return out
+
+
+def api_dashboard():
+    c, m = cfg(), meta()
+    d = load_users()
+    now = time.time()
+    nodes = []
+    for ib in c.get("inbounds", []):
+        t = ib.get("tag")
+        if t.endswith("-ss") and ib.get("listen") == "127.0.0.1":
+            continue
+        lv = STATS["live"].get(t, {})
+        tot = STATS["totals"].get(t, {})
+        p = node_proto(ib, m)
+        multi = p in MULTI_USER and bool(ib.get("users"))
+        nodes.append({"tag": t, "name": m.get(t, {}).get("name", t), "proto": p,
+                      "port": ib.get("listen_port"), "multi": multi,
+                      # 不支持多用户的节点，分配了也不会生效，不能算进去
+                      "users": sum(1 for u in d["users"] if t in (u.get("inbounds") or []) and user_active(u, now))
+                      if multi else None,
+                      "conns": lv.get("conns", 0), "ips": lv.get("ips", 0),
+                      "up_rate": lv.get("up_rate", 0), "down_rate": lv.get("down_rate", 0),
+                      "up": tot.get("up", 0), "down": tot.get("down", 0)})
+    act = cached("sb_state", 10,
+                 lambda: (sh("systemctl is-active sing-box", 5)[1].strip() or "unknown"))
+    return {"sys": dict(SYSMON["cur"], **sys_static(), ip=public_ip()),
+            "hist": SYSMON["hist"][-60:],
+            "sb": dict(sb_proc(), running=act == "active", version=cur_version_cached(),
+                       conns=STATS["conns"]),
+            "stats": {"ok": STATS["ok"], "err": STATS["err"], "rate": STATS["rate"],
+                      "mode": "iptables" if ACCT.get("ok") else "clash",
+                      "acct_err": ACCT.get("err", ""),
+                      "hist": STATS["hist"][-60:],
+                      "disabled": bool(load_json(PANEL_CFG, {}).get("stats_disabled"))},
+            "users": {"total": len(d["users"]),
+                      "active": sum(1 for u in d["users"] if user_active(u, now))},
+            "nodes": nodes}
+
+
+def cur_version_cached():
+    return cached("sb_ver", 60, cur_version)
+
+
+def api_stats_reset(tag):
+    if tag:
+        STATS["totals"].pop(tag, None)
+    else:
+        STATS["totals"].clear()
+    save_json(STATS_FILE, {"totals": STATS["totals"]})
+    return True, "已清零"
+
+
+def api_stats_toggle(on):
+    pc = load_json(PANEL_CFG, {})
+    if on:
+        pc.pop("stats_disabled", None)
+    else:
+        pc["stats_disabled"] = True
+    save_json(PANEL_CFG, pc)
+    okk, msg = apply_config(cfg())
+    return (True, "流量统计已" + ("开启" if on else "关闭")) if okk else (False, msg)
+
+
+# ════════════════════════════════════════════
+# 路由规则 / DNS 可视化编辑（参照 s-ui Rules / DNS）
+# ════════════════════════════════════════════
+def _dict_list(v, what):
+    if not isinstance(v, list) or not all(isinstance(x, dict) for x in v):
+        raise ValueError(f"{what} 格式错误")
+    return v
+
+
+def api_route_get():
+    c = cfg()
+    r = c.get("route") or {}
+    return {"rules": r.get("rules") or [], "rule_set": r.get("rule_set") or [],
+            "final": r.get("final") or "direct",
+            "outbounds": [o.get("tag") for o in c.get("outbounds", [])],
+            "inbounds": [i.get("tag") for i in c.get("inbounds", [])
+                         if not (i.get("tag", "").endswith("-ss") and i.get("listen") == "127.0.0.1")],
+            "dns_servers": [s.get("tag") for s in (c.get("dns") or {}).get("servers", [])]}
+
+
+def api_route_set(b):
+    c = cfg()
+    try:
+        rules = _dict_list(b.get("rules", []), "规则")
+        rsets = _dict_list(b.get("rule_set", []), "规则集")
+    except ValueError as e:
+        return False, str(e)
+    tags = [x.get("tag") for x in rsets]
+    if any(not t for t in tags) or len(tags) != len(set(tags)):
+        return False, "规则集标签不能为空或重复"
+    # 按域名 / 协议分流离不开嗅探；用户把它删了就补回最前面
+    if not any(r.get("action") == "sniff" for r in rules):
+        rules = [{"action": "sniff"}] + rules
+    route = dict(c.get("route") or {})
+    route["rules"] = rules
+    if rsets:
+        route["rule_set"] = rsets
+    else:
+        route.pop("rule_set", None)
+    final = (b.get("final") or "direct").strip()
+    if final not in {o.get("tag") for o in c.get("outbounds", [])}:
+        return False, f"默认出站 {final} 不存在"
+    route["final"] = final
+    # 远程规则集需要显式的 HTTP 客户端（1.14 起隐式默认已弃用）
+    if any(x.get("type") == "remote" for x in rsets) and not c.get("http_clients"):
+        c["http_clients"] = [{"tag": "direct-http"}]
+        route["default_http_client"] = "direct-http"
+    c["route"] = route
+    okk, msg = apply_config(c)
+    return (True, "路由已保存") if okk else (False, msg)
+
+
+def api_dns_get():
+    c = cfg()
+    ddr = (c.get("route") or {}).get("default_domain_resolver")
+    return {"dns": c.get("dns") or {},
+            "resolver": (ddr.get("server") if isinstance(ddr, dict) else ddr) or "",
+            "outbounds": [o.get("tag") for o in c.get("outbounds", [])],
+            "rule_sets": [x.get("tag") for x in (c.get("route") or {}).get("rule_set", [])],
+            "inbounds": [i.get("tag") for i in c.get("inbounds", [])]}
+
+
+def api_dns_set(b):
+    c = cfg()
+    dns = b.get("dns")
+    if not isinstance(dns, dict):
+        return False, "DNS 格式错误"
+    try:
+        servers = _dict_list(dns.get("servers", []), "DNS 服务器")
+        _dict_list(dns.get("rules", []), "DNS 规则")
+    except ValueError as e:
+        return False, str(e)
+    st = [s.get("tag") for s in servers]
+    if any(not t for t in st) or len(st) != len(set(st)):
+        return False, "DNS 服务器标签不能为空或重复"
+    dns = {k: v for k, v in dns.items() if v not in (None, "", [], {})}
+    route = c.setdefault("route", {})
+    if dns:
+        c["dns"] = dns
+    else:
+        c.pop("dns", None)
+    # 配了不止一个 DNS 服务器时，sing-box 要求指定出站解析域名用哪个（1.12 起）
+    want = (b.get("resolver") or "").strip()
+    if want and want not in st:
+        return False, f"出站解析服务器 {want} 不存在"
+    if not want and st:
+        cur = route.get("default_domain_resolver")
+        cur = cur.get("server") if isinstance(cur, dict) else cur
+        want = cur if cur in st else (dns.get("final") if dns.get("final") in st else st[0])
+    if want:
+        route["default_domain_resolver"] = want
+    else:
+        route.pop("default_domain_resolver", None)
+    okk, msg = apply_config(c)
+    return (True, "DNS 已保存") if okk else (False, msg)
+
+
+# ════════════════════════════════════════════
+# 备份 / 恢复
+# ════════════════════════════════════════════
+def api_backup():
+    pc = load_json(PANEL_CFG, {})
+    return {"app": "sb-panel", "ver": 1, "time": time.strftime("%F %T"),
+            "config": cfg(), "meta": meta(), "users": load_users(),
+            "panel": {k: pc[k] for k in ("sub_token", "auto_update") if k in pc}}
+
+
+def api_restore(b):
+    bk = b.get("backup")
+    if not isinstance(bk, dict) or bk.get("app") != "sb-panel" or not isinstance(bk.get("config"), dict):
+        return False, "不是本面板导出的备份文件"
+    if not isinstance(bk.get("config", {}).get("inbounds", []), list):
+        return False, "备份里的配置格式错误"
+    old_meta, old_users = load_json(META_FILE, {}), load_json(USERS_FILE, None)
+    save_json(META_FILE, bk.get("meta") or {})
+    save_json(USERS_FILE, bk.get("users") or {"users": [], "managed": {}})
+    okk, msg = apply_config(bk["config"])
+    if not okk:
+        save_json(META_FILE, old_meta)
+        if old_users is not None:
+            save_json(USERS_FILE, old_users)
+        return False, msg
+    pc = load_json(PANEL_CFG, {})
+    pc.update(bk.get("panel") or {})
+    save_json(PANEL_CFG, pc)
+    rebuild_sub()
+    return True, "已恢复"
+
+
 HTML = r"""<!doctype html><html lang="zh"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>sing-box 面板</title><style>
@@ -2482,6 +3455,7 @@ HTML = r"""<!doctype html><html lang="zh"><head><meta charset="utf-8">
  --tx:#e8eaf0; --tx2:#8b93a7; --tx3:#5c6478;
  --pri:#3b82f6; --pri2:#2563eb; --ok:#34d399; --warn:#fbbf24; --err:#f87171;
  --r:12px; --r2:9px; --sh:0 1px 3px rgba(0,0,0,.4),0 8px 24px -8px rgba(0,0,0,.5);
+ --side:228px;
 }
 *{box-sizing:border-box;margin:0;padding:0}
 body{background:var(--bg);color:var(--tx);
@@ -2489,29 +3463,54 @@ body{background:var(--bg);color:var(--tx);
  -webkit-font-smoothing:antialiased}
 a{color:var(--pri);text-decoration:none}
 a:hover{opacity:.8}
-.wrap{max-width:1180px;margin:0 auto;padding:0 20px 48px}
-header{position:sticky;top:0;z-index:20;background:var(--bg);
- border-bottom:1px solid var(--line);
- display:flex;align-items:center;gap:20px;padding:14px 0;margin-bottom:22px;flex-wrap:wrap}
-h1{font-size:16px;font-weight:650;letter-spacing:.2px;white-space:nowrap}
+/* ── 布局：左侧导航（参照 s-ui）── */
+.side{position:fixed;top:0;bottom:0;left:0;width:var(--side);background:var(--bg2);
+ border-right:1px solid var(--line);display:flex;flex-direction:column;z-index:40;transition:transform .2s}
+.brand{display:flex;align-items:center;gap:10px;padding:18px 18px 14px;font-weight:650;font-size:15.5px}
+.brand i{width:30px;height:30px;border-radius:9px;background:linear-gradient(135deg,var(--pri),#8b5cf6);
+ display:grid;place-items:center;font-style:normal;font-size:14px;color:#fff}
+.nav{flex:1;overflow-y:auto;padding:4px 10px 12px}
+.nav a{display:flex;align-items:center;gap:11px;padding:8px 12px;margin:1px 0;border-radius:var(--r2);
+ color:var(--tx2);font-size:13.5px;font-weight:500;cursor:pointer;user-select:none;transition:.12s}
+.nav a:hover{background:var(--card2);color:var(--tx);opacity:1}
+.nav a.active{background:rgba(59,130,246,.14);color:#fff}
+.nav a.active svg{color:var(--pri)}
+.nav svg{width:18px;height:18px;flex:0 0 auto}
+.nav .sep{height:1px;background:var(--line);margin:8px 6px}
+.sidefoot{padding:12px 16px;border-top:1px solid var(--line);font-size:11.5px;color:var(--tx3)}
+.main{margin-left:var(--side);min-width:0}
+.topbar{position:sticky;top:0;z-index:20;background:rgba(13,15,19,.92);backdrop-filter:blur(8px);
+ border-bottom:1px solid var(--line);display:flex;align-items:center;gap:14px;padding:11px 24px;flex-wrap:wrap}
+.topbar h1{font-size:16px;font-weight:650;white-space:nowrap}
+.burger{display:none;background:none;border:0;padding:4px;color:var(--tx);cursor:pointer}
+.burger svg{width:22px;height:22px}
+.content{padding:20px 24px 48px;max-width:1320px}
+.mask{display:none}
+@media(max-width:900px){
+ .side{transform:translateX(-100%)} .side.open{transform:none;box-shadow:var(--sh)}
+ .main{margin-left:0} .burger{display:block}
+ .mask.show{display:block;position:fixed;inset:0;background:rgba(0,0,0,.55);z-index:35}
+ .content{padding:16px 14px 40px} .topbar{padding:10px 14px}}
+@media(max-width:600px){.topbar .stat{display:none} .topbar{flex-wrap:nowrap} .topbar h1{flex:1}
+ .content .tiles{grid-template-columns:1fr 1fr;gap:10px} .content .gauge{flex-direction:column;text-align:center;gap:6px;padding:12px 8px}
+ .content .gauge svg{width:62px;height:62px} .content .gauge .gt{width:100%}}
 .stat{display:flex;gap:16px;font-size:12.5px;color:var(--tx2);flex-wrap:wrap;flex:1}
 .stat b{color:var(--tx);font-weight:600}
 .dot{display:inline-block;width:7px;height:7px;border-radius:50%;margin-right:6px;vertical-align:1px}
 .on{background:var(--ok);box-shadow:0 0 0 3px rgba(52,211,153,.15)}
 .off{background:var(--err);box-shadow:0 0 0 3px rgba(248,113,113,.15)}
-.tabs{display:flex;gap:2px;margin-bottom:20px;flex-wrap:wrap;
- background:var(--bg2);padding:4px;border-radius:var(--r);width:fit-content}
-.tab{padding:7px 16px;border-radius:var(--r2);cursor:pointer;color:var(--tx2);
- font-size:13.5px;font-weight:500;transition:.15s;user-select:none}
-.tab:hover{color:var(--tx)}
-.tab.active{background:var(--card2);color:#fff;box-shadow:0 1px 2px rgba(0,0,0,.3)}
 .card{background:var(--card);border:1px solid var(--line);border-radius:var(--r);
- padding:16px 18px;margin-bottom:12px;transition:border-color .15s}
+ padding:16px 18px;margin-bottom:12px;transition:border-color .15s;min-width:0}
 .card:hover{border-color:var(--line2)}
 .card h3{font-size:14.5px;font-weight:600;margin-bottom:10px;
  display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+.card h3 .sp{flex:1}
 .badge{font-size:10.5px;padding:2px 8px;border-radius:20px;background:var(--bg2);
- color:var(--tx2);font-weight:500;border:1px solid var(--line)}
+ color:var(--tx2);font-weight:500;border:1px solid var(--line);white-space:nowrap}
+.badge.g{background:rgba(52,211,153,.12);color:var(--ok);border-color:rgba(52,211,153,.3)}
+.badge.y{background:rgba(251,191,36,.12);color:var(--warn);border-color:rgba(251,191,36,.3)}
+.badge.r{background:rgba(248,113,113,.12);color:var(--err);border-color:rgba(248,113,113,.3)}
+.badge.b{background:rgba(59,130,246,.12);color:#93c5fd;border-color:rgba(59,130,246,.3)}
 .row{display:flex;justify-content:space-between;align-items:center;gap:12px;
  padding:7px 0;font-size:13px;border-bottom:1px solid var(--line)}
 .row:last-of-type{border:0}
@@ -2532,18 +3531,23 @@ button:disabled{opacity:.45;cursor:not-allowed}
 .btn2:hover{background:#252b38;border-color:#3a4356}
 .btnd{background:rgba(248,113,113,.1);color:var(--err);border:1px solid rgba(248,113,113,.25)}
 .btnd:hover{background:rgba(248,113,113,.18)}
-.acts{display:flex;gap:8px;margin-top:13px;flex-wrap:wrap}
+.sm{padding:4px 10px;font-size:12px}
+.acts{display:flex;gap:8px;margin-top:13px;flex-wrap:wrap;align-items:center}
+.bar{display:flex;gap:8px;margin-bottom:14px;flex-wrap:wrap;align-items:center}
+.bar .sp{flex:1}
 label{display:block;font-size:12.5px;color:var(--tx2);margin:13px 0 5px;font-weight:500}
 label .hint{color:var(--tx3);font-weight:400;font-size:11.5px;margin-left:6px}
-input,select{width:100%;background:#0a0c10;border:1px solid var(--line2);
+input,select,textarea{width:100%;background:#0a0c10;border:1px solid var(--line2);
  border-radius:var(--r2);padding:9px 11px;color:var(--tx);font-size:13.5px;
  font-family:inherit;transition:.15s}
-input:focus,select:focus{outline:0;border-color:var(--pri);box-shadow:0 0 0 3px rgba(59,130,246,.12)}
-input::placeholder{color:var(--tx3)}
+textarea{font:12px/1.55 ui-monospace,Menlo,monospace;resize:vertical;min-height:64px}
+input:focus,select:focus,textarea:focus{outline:0;border-color:var(--pri);box-shadow:0 0 0 3px rgba(59,130,246,.12)}
+input::placeholder,textarea::placeholder{color:var(--tx3)}
 select{cursor:pointer}
-.f2{display:grid;grid-template-columns:1fr 1fr;gap:12px}
-.f2 label{margin-top:13px}
-@media(max-width:560px){.f2{grid-template-columns:1fr}}
+.bar input,.bar select{width:auto;padding:7px 10px;font-size:13px}
+.f2{display:grid;grid-template-columns:1fr 1fr;gap:0 12px}
+.f3{display:grid;grid-template-columns:1fr 1fr 1fr;gap:0 12px}
+@media(max-width:600px){.f2,.f3{grid-template-columns:1fr}}
 .chk{display:flex;align-items:center;gap:10px;padding:8px 10px;border-radius:var(--r2);
  cursor:pointer;margin:0;color:var(--tx);font-size:13.5px;transition:background-color .12s}
 .chk:hover{background:var(--card2)}
@@ -2551,6 +3555,7 @@ select{cursor:pointer}
 .chk span{flex:0 0 auto;white-space:nowrap}
 .chk i{color:var(--tx3);font-style:normal;font-size:11.5px;line-height:1.45;flex:1;min-width:0}
 .chk em{color:var(--warn);font-style:normal;font-size:11px;margin-left:7px}
+.chk.dis{opacity:.45;cursor:not-allowed}
 .hbadge{font-size:11.5px;padding:3px 10px;border-radius:20px;cursor:pointer;
  font-weight:600;white-space:nowrap;transition:.15s;border:1px solid transparent}
 .hbadge.green{background:rgba(52,211,153,.12);color:var(--ok);border-color:rgba(52,211,153,.3)}
@@ -2561,7 +3566,7 @@ select{cursor:pointer}
 .hitem b{display:block;font-size:11.5px;color:var(--tx2);font-weight:500;margin-bottom:3px}
 .hitem span{font-size:13px}
 .chkbox{background:#0a0c10;border:1px solid var(--line2);border-radius:var(--r2);
- padding:5px;max-height:220px;overflow:auto}
+ padding:5px;max-height:240px;overflow:auto}
 details{border:1px solid var(--line);border-radius:var(--r2);margin-top:14px;
  background:var(--bg2);overflow:hidden}
 details[open]{border-color:var(--line2)}
@@ -2573,6 +3578,55 @@ summary::before{content:"\25B8";display:inline-block;margin-right:8px;transition
 details[open] summary::before{transform:rotate(90deg)}
 .dbody{padding:2px 13px 14px}
 .grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(330px,1fr));gap:12px}
+.grid2{display:grid;grid-template-columns:repeat(auto-fit,minmax(360px,1fr));gap:12px}
+@media(max-width:600px){.grid,.grid2{grid-template-columns:1fr}}
+/* ── 仪表盘 ── */
+.tiles{display:grid;grid-template-columns:repeat(auto-fit,minmax(215px,1fr));gap:12px;margin-bottom:12px}
+.gauge{display:flex;align-items:center;gap:14px;padding:16px}
+.gauge svg{width:74px;height:74px;flex:0 0 auto}
+.gauge .gt{min-width:0}
+.gauge .gt b{display:block;font-size:12.5px;color:var(--tx2);font-weight:500}
+.gauge .gt span{display:block;font-size:12px;color:var(--tx3);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.chart{width:100%;height:120px;display:block}
+.legend{display:flex;gap:16px;font-size:12px;color:var(--tx2);margin-top:6px;flex-wrap:wrap}
+.legend i{display:inline-block;width:10px;height:3px;border-radius:2px;margin-right:6px;vertical-align:3px}
+.big{font-size:20px;font-weight:650;letter-spacing:.2px}
+/* ── 表格 ── */
+.tbl{width:100%;border-collapse:collapse;font-size:13px}
+.tbl th{text-align:left;color:var(--tx2);font-weight:500;font-size:12px;padding:8px 10px;
+ border-bottom:1px solid var(--line2);white-space:nowrap}
+.tbl td{padding:9px 10px;border-bottom:1px solid var(--line);vertical-align:middle}
+.tbl tr:hover td{background:rgba(255,255,255,.015)}
+.tbl input[type=checkbox]{width:15px;height:15px;accent-color:var(--pri)}
+.tw{overflow-x:auto;margin:0 -4px}
+.num{font-variant-numeric:tabular-nums}
+.mut{color:var(--tx3)}
+/* 开关 */
+.sw{position:relative;display:inline-block;width:34px;height:19px;flex:0 0 auto}
+.sw input{opacity:0;width:0;height:0}
+.sw span{position:absolute;inset:0;background:var(--line2);border-radius:20px;transition:.15s;cursor:pointer}
+.sw span::before{content:"";position:absolute;width:15px;height:15px;left:2px;top:2px;background:#fff;border-radius:50%;transition:.15s}
+.sw input:checked+span{background:var(--ok)}
+.sw input:checked+span::before{transform:translateX(15px)}
+/* 规则卡片 */
+.rule{display:flex;align-items:center;gap:10px;padding:10px 12px;border:1px solid var(--line);
+ border-radius:var(--r2);background:var(--bg2);margin-bottom:8px}
+.rule .ri{color:var(--tx3);font-size:12px;width:20px;text-align:center;flex:0 0 auto}
+.rule .rb{flex:1;min-width:0;font-size:13px}
+.rule .rb .c{display:inline-block;font-size:11.5px;padding:1px 7px;border-radius:6px;background:var(--card2);
+ border:1px solid var(--line2);margin:2px 4px 2px 0;color:var(--tx2);max-width:100%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;vertical-align:middle}
+.rule .ra{white-space:nowrap;font-size:12.5px;font-weight:600}
+.rule .ops{display:flex;gap:4px;flex:0 0 auto}
+.ib{background:none;border:1px solid transparent;color:var(--tx2);padding:4px 7px;border-radius:7px;font-size:12px}
+.ib:hover{background:var(--card2);color:var(--tx);border-color:var(--line2)}
+.ib:disabled{opacity:.25}
+.dirty{color:var(--warn);font-size:12px}
+/* 标签页（弹窗内） */
+.mtabs{display:flex;gap:2px;margin:14px 0 4px;background:var(--bg2);padding:4px;border-radius:var(--r);width:100%}
+.mtab{flex:1;text-align:center;padding:7px 12px;border-radius:var(--r2);cursor:pointer;color:var(--tx2);
+ font-size:13px;font-weight:500;user-select:none;transition:.15s}
+.mtab:hover{color:var(--tx)}
+.mtab.active{background:var(--card2);color:#fff;box-shadow:0 1px 2px rgba(0,0,0,.3)}
 .modal{position:fixed;inset:0;background:rgba(0,0,0,.8);
  display:none;align-items:flex-start;justify-content:center;
  padding:4vh 20px 20px;z-index:99;overscroll-behavior:contain}
@@ -2581,17 +3635,14 @@ details[open] summary::before{transform:rotate(90deg)}
 .mbox{background:var(--card);border:1px solid var(--line2);border-radius:16px;
  padding:22px 24px;max-width:560px;width:100%;max-height:92vh;overflow-y:auto;
  box-shadow:var(--sh);animation:pop .2s cubic-bezier(.2,.9,.3,1.2);
- overscroll-behavior:contain;   /* 滚到头不传导给背景页，消除跳动 */
- scrollbar-gutter:stable;
- transform:translateZ(0);       /* 独立合成层，滚动不牵连祖先重绘 */
- contain:paint}
-/* 滚动过程中临时关掉 hover，避免行块从光标下经过时一亮一暗 */
+ overscroll-behavior:contain;scrollbar-gutter:stable;transform:translateZ(0);contain:paint}
+.mbox.wide{max-width:780px}
 .mbox.scrolling *{pointer-events:none}
 @keyframes pop{from{transform:translateY(12px) scale(.98);opacity:0}}
 .mbox h2{font-size:16.5px;font-weight:650;margin-bottom:4px}
 .toast{position:fixed;bottom:26px;left:50%;transform:translateX(-50%);
  background:var(--card2);border:1px solid var(--line2);padding:11px 20px;
- border-radius:11px;display:none;z-index:100;max-width:90%;font-size:13.5px;box-shadow:var(--sh)}
+ border-radius:11px;display:none;z-index:100;max-width:90%;font-size:13.5px;box-shadow:var(--sh);white-space:pre-wrap}
 .toast.show{display:block;animation:up .22s cubic-bezier(.2,.9,.3,1.2)}
 @keyframes up{from{transform:translate(-50%,14px);opacity:0}}
 .toast.err{border-color:rgba(248,113,113,.4);color:#ffb4b4}
@@ -2599,6 +3650,8 @@ details[open] summary::before{transform:rotate(90deg)}
 .alert{background:rgba(251,191,36,.07);border:1px solid rgba(251,191,36,.28);
  color:#f5d78e;border-radius:var(--r2);padding:11px 13px;font-size:12.5px;
  margin-bottom:10px;line-height:1.7}
+.note{background:rgba(59,130,246,.06);border:1px solid rgba(59,130,246,.22);color:#a9c8f5;
+ border-radius:var(--r2);padding:10px 13px;font-size:12.5px;margin-bottom:12px;line-height:1.7}
 .cmd{background:#0a0c10;border:1px solid var(--line);border-radius:7px;padding:8px 10px;
  margin-top:8px;font:11px/1.5 ui-monospace,Menlo,monospace;color:#8fd0ff;
  word-break:break-all;user-select:all}
@@ -2623,15 +3676,15 @@ pre{background:#0a0c10;padding:12px;border-radius:var(--r2);overflow:auto;
  border-top-color:var(--pri);border-radius:50%;animation:sp .7s linear infinite;
  vertical-align:-1px;margin-right:7px}
 @keyframes sp{to{transform:rotate(360deg)}}
-body.mopen{overflow:hidden}      /* 弹窗打开时锁住背景，避免滚轮穿透 */
-.login{max-width:350px;margin:16vh auto}
+body.mopen{overflow:hidden}
+.login{max-width:350px;margin:16vh auto;padding:0 20px}
 .login .card{padding:24px}
 ::-webkit-scrollbar{width:9px;height:9px}
 ::-webkit-scrollbar-track{background:transparent}
 ::-webkit-scrollbar-thumb{background:var(--line2);border-radius:6px}
 ::-webkit-scrollbar-thumb:hover{background:#3a4356}
 </style></head><body>
-<div id="login" class="wrap login" style="display:none">
+<div id="login" class="login" style="display:none">
   <div class="card"><h3>sing-box 面板</h3>
     <label>用户名</label><input type="text" id="usr" autocomplete="username"
       onkeydown="if(event.key==='Enter')document.getElementById('pw').focus()">
@@ -2640,32 +3693,39 @@ body.mopen{overflow:hidden}      /* 弹窗打开时锁住背景，避免滚轮�
     <div class="acts"><button onclick="doLogin()">登录</button></div>
   </div>
 </div>
-<div id="app" style="display:none"><div class="wrap">
-<header><h1>sing-box 面板</h1>
-  <span id="hbadge" class="hbadge" title="系统健康" onclick="tab('log')">检查中…</span>
+<div id="app" style="display:none">
+<aside class="side" id="side">
+  <div class="brand"><i>S</i>sing-box 面板</div>
+  <nav class="nav" id="nav"></nav>
+  <div class="sidefoot" id="sidefoot">—</div>
+</aside>
+<div class="mask" id="mask" onclick="sideOpen(0)"></div>
+<div class="main">
+<header class="topbar">
+  <button class="burger" onclick="sideOpen(1)" aria-label="菜单"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M4 6h16M4 12h16M4 18h16"/></svg></button>
+  <h1 id="ptitle">首页</h1>
+  <span id="hbadge" class="hbadge" title="系统健康" onclick="go('log')">检查中…</span>
   <div class="stat" id="stat"></div>
   <div style="display:flex;gap:8px">
     <button class="btn2" onclick="restart()">重启</button>
     <button class="btn2" onclick="logout()">退出</button>
   </div>
 </header>
-<div class="tabs">
-  <div class="tab active" data-t="in" onclick="tab('in')">节点</div>
-  <div class="tab" data-t="out" onclick="tab('out')">出站</div>
-  <div class="tab" data-t="cert" onclick="tab('cert')">证书</div>
-  <div class="tab" data-t="sub" onclick="tab('sub')">订阅</div>
-  <div class="tab" data-t="ver" onclick="tab('ver')">版本</div>
-  <div class="tab" data-t="log" onclick="tab('log')">日志</div>
-</div>
-<div id="v-in"><div class="acts" style="margin-bottom:14px"><button onclick="newNode()">+ 添加节点</button></div><div id="inlist" class="grid"></div></div>
-<div id="v-out" style="display:none"><div class="acts" style="margin-bottom:14px"><button onclick="newOut()">+ 添加出站</button>
+<div class="content">
+<div id="p-home"></div>
+<div id="p-in" style="display:none"><div class="bar"><button onclick="newNode()">+ 添加节点</button><span class="sp"></span><span class="mut" style="font-size:12px">流量为节点累计 · 首页可看实时速度</span></div><div id="inlist" class="grid"></div></div>
+<div id="p-users" style="display:none"></div>
+<div id="p-out" style="display:none"><div class="bar"><button onclick="newOut()">+ 添加出站</button>
  <button class="btn2" onclick="speedAll()">⚡ 全部测延迟</button></div><div id="outlist" class="grid"></div></div>
-<div id="v-cert" style="display:none"><div class="acts" style="margin-bottom:14px"><button onclick="newCert()">+ 申请证书</button></div><div id="certlist" class="grid"></div></div>
-<div id="v-sub" style="display:none"><div class="card"><h3>订阅链接</h3>
+<div id="p-cert" style="display:none"><div class="bar"><button onclick="newCert()">+ 申请证书</button></div><div id="certlist" class="grid"></div></div>
+<div id="p-route" style="display:none"></div>
+<div id="p-dns" style="display:none"></div>
+<div id="p-sub" style="display:none"><div class="card"><h3>订阅链接 <span class="badge">包含全部节点</span></h3>
  <div class="uri" id="suburl" onclick="cp(this.textContent)"></div>
- <div id="subinfo" style="margin-top:12px"></div></div></div>
-<div id="v-ver" style="display:none"><div id="verbox"></div></div>
-<div id="v-log" style="display:none">
+ <div id="subinfo" style="margin-top:12px"></div></div>
+ <div class="note">每个用户还有自己的订阅链接，只包含分配给他的节点，在「用户」页的「链接」里查看。</div></div>
+<div id="p-ver" style="display:none"><div id="verbox"></div></div>
+<div id="p-log" style="display:none">
  <div class="card"><h3>系统健康 <span id="hdetail" class="badge">…</span></h3>
   <div id="hbox"></div>
   <div class="acts"><button class="btn2" onclick="loadHealth()">刷新</button></div></div>
@@ -2676,48 +3736,353 @@ body.mopen{overflow:hidden}      /* 弹窗打开时锁住背景，避免滚轮�
  <div id="log-ctl"></div>
  <div class="acts" style="margin-bottom:10px"><button class="btn2" onclick="loadLog()">刷新</button></div>
  <pre id="logbox"></pre></div></div>
-</div></div>
+<div id="p-set" style="display:none"></div>
+</div></div></div>
 <div class="modal" id="modal"><div class="mbox" id="mbox"></div></div>
 <div class="toast" id="toast"></div>
 <script>
 const BASE='__BASE__';
-let TK=localStorage.getItem('tk')||'',PROTOS={},CERTS=[],OUTS=[];
-function msg(t,ok){const e=document.getElementById('toast');e.textContent=t;e.className='toast show '+(ok?'ok':'err');setTimeout(()=>e.className='toast',3500)}
+let TK=localStorage.getItem('tk')||'',PROTOS={},CERTS=[],OUTS=[],USERS=null;
+const $=id=>document.getElementById(id);
+function msg(t,ok){const e=$('toast');e.textContent=t;e.className='toast show '+(ok?'ok':'err');clearTimeout(msg._t);msg._t=setTimeout(()=>e.className='toast',ok?3000:6000)}
 async function api(p,m,b){const r=await fetch(BASE+'/api'+p,{method:m||'GET',headers:{'Content-Type':'application/json','X-Token':TK},body:b?JSON.stringify(b):null});
  if(r.status===401){TK='';localStorage.removeItem('tk');show(0);throw new Error('未登录')}return r.json()}
-function show(in_){document.getElementById('login').style.display=in_?'none':'block';document.getElementById('app').style.display=in_?'block':'none';
- if(in_){refresh();startHealthPoll()}else if(_hTimer){clearInterval(_hTimer);_hTimer=null}}
-async function doLogin(){const pw=document.getElementById('pw').value;
- const us=document.getElementById('usr').value;
- const r=await(await fetch(BASE+'/api/login',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({username:us,password:pw})})).json();
- if(r.ok){TK=r.token;localStorage.setItem('tk',TK);show(1)}else msg('密码错误')}
-function logout(){TK='';localStorage.removeItem('tk');show(0)}
-function tab(t){document.querySelectorAll('.tab').forEach(e=>e.classList.toggle('active',e.dataset.t===t));
- ['in','out','cert','sub','ver','log'].forEach(x=>document.getElementById('v-'+x).style.display=x===t?'block':'none');
- if(t==='cert')loadCerts();if(t==='sub')loadSub();if(t==='ver')loadVer();if(t==='log'){loadLog();loadHealth()}}
-function closeM(){document.getElementById('modal').classList.remove('show')}
-function cp(t){navigator.clipboard.writeText(t).then(()=>msg('已复制',1))}
-async function refresh(){const s=await api('/status');
- document.getElementById('stat').innerHTML=`<span><span class="dot ${s.running?'on':'off'}"></span>${s.running?'运行中':'已停止'}</span><span>版本 <b>${s.version}</b></span><span>IP <b>${s.ip}</b></span><span>节点 <b>${s.inbounds}</b></span><span>出站 <b>${s.outbounds}</b></span>`;
- PROTOS=await api('/protocols');loadIn();loadOut();loadHealth()}
+function esc(s){return String(s==null?'':s).replace(/[<>&"']/g,c=>({'<':'&lt;','>':'&gt;','&':'&amp;','"':'&quot;',"'":'&#39;'}[c]))}
+function cp(t){navigator.clipboard.writeText(t).then(()=>msg('已复制',1),()=>msg('复制失败，请手动选择'))}
+function openM(html,wide){const b=$('mbox');b.className='mbox'+(wide?' wide':'');b.innerHTML=html;$('modal').classList.add('show')}
+function closeM(){$('modal').classList.remove('show')}
 
-// 健康状态每 60 秒自查一次，异常会在顶栏徽章上直接显示
-let _hTimer=null;
-function startHealthPoll(){if(_hTimer)clearInterval(_hTimer);
- _hTimer=setInterval(()=>{if(TK)loadHealth().catch(()=>{})},60000)}
+// ── 格式化 ──
+function fmtB(n){n=+n||0;const u=['B','KB','MB','GB','TB'];let i=0;while(n>=1024&&i<u.length-1){n/=1024;i++}return (i?n.toFixed(n<10?2:1):n)+' '+u[i]}
+function fmtR(n){return fmtB(n)+'/s'}
+function fmtDur(s){if(s==null)return '—';const d=Math.floor(s/86400),h=Math.floor(s%86400/3600),m=Math.floor(s%3600/60);
+ return d?`${d}天${h}小时`:(h?`${h}小时${m}分`:`${m}分`)}
+function fmtTs(ts){if(!ts)return '—';const d=new Date(ts*1000);const p=x=>String(x).padStart(2,'0');
+ return `${d.getFullYear()}-${p(d.getMonth()+1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`}
+function toLocalInput(ts){if(!ts)return '';const d=new Date(ts*1000);const p=x=>String(x).padStart(2,'0');
+ return `${d.getFullYear()}-${p(d.getMonth()+1)}-${p(d.getDate())}T${p(d.getHours())}:${p(d.getMinutes())}`}
+function expTxt(u){if(!u.expiry)return '<span class="mut">永久</span>';
+ const left=u.expiry-Date.now()/1000;
+ if(left<=0)return '<span class="badge r">已过期</span>';
+ const d=Math.ceil(left/86400);return `<span class="${d<=3?'badge y':''}" title="${fmtTs(u.expiry)}">剩 ${d} 天</span>`}
+
+// ── 导航 ──
+const IC={
+ home:'<path d="M3 11.5 12 4l9 7.5"/><path d="M5 10v10h5v-6h4v6h5V10"/>',
+ in:'<path d="M7 18a5 5 0 1 1 .9-9.9A6 6 0 0 1 19 10a4 4 0 0 1-1 7.9"/><path d="M12 11v9m-3-3 3 3 3-3"/>',
+ users:'<circle cx="9" cy="8" r="3.5"/><path d="M2.5 20a6.5 6.5 0 0 1 13 0"/><path d="M16 4.5a3.5 3.5 0 0 1 0 7M18 14a6 6 0 0 1 3.5 6"/>',
+ out:'<path d="M7 18a5 5 0 1 1 .9-9.9A6 6 0 0 1 19 10a4 4 0 0 1-1 7.9"/><path d="M12 20v-9m-3 3 3-3 3 3"/>',
+ cert:'<rect x="4" y="3" width="16" height="13" rx="2"/><path d="M8 8h8M8 11h5"/><path d="m9 16-1 5 4-2 4 2-1-5"/>',
+ route:'<circle cx="6" cy="19" r="2"/><circle cx="18" cy="5" r="2"/><path d="M6 17V9a3 3 0 0 1 3-3h7M18 7v8a3 3 0 0 1-3 3H8"/>',
+ dns:'<rect x="3" y="4" width="18" height="6" rx="1.5"/><rect x="3" y="14" width="18" height="6" rx="1.5"/><path d="M7 7h.01M7 17h.01"/>',
+ sub:'<path d="M10 14a4 4 0 0 0 5.7 0l3-3a4 4 0 0 0-5.7-5.7l-1 1"/><path d="M14 10a4 4 0 0 0-5.7 0l-3 3a4 4 0 0 0 5.7 5.7l1-1"/>',
+ ver:'<path d="M20 12a8 8 0 1 1-2.3-5.7"/><path d="M20 4v5h-5"/>',
+ log:'<path d="M5 4h14v16H5z"/><path d="M8 8h8M8 12h8M8 16h5"/>',
+ set:'<circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.7 1.7 0 0 0 .3 1.8l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.7 1.7 0 0 0-1.8-.3 1.7 1.7 0 0 0-1 1.5V21a2 2 0 1 1-4 0v-.1a1.7 1.7 0 0 0-1.1-1.5 1.7 1.7 0 0 0-1.8.3l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1a1.7 1.7 0 0 0 .3-1.8 1.7 1.7 0 0 0-1.5-1H3a2 2 0 1 1 0-4h.1a1.7 1.7 0 0 0 1.5-1.1 1.7 1.7 0 0 0-.3-1.8l-.1-.1a2 2 0 1 1 2.8-2.8l.1.1a1.7 1.7 0 0 0 1.8.3H9a1.7 1.7 0 0 0 1-1.5V3a2 2 0 1 1 4 0v.1a1.7 1.7 0 0 0 1 1.5 1.7 1.7 0 0 0 1.8-.3l.1-.1a2 2 0 1 1 2.8 2.8l-.1.1a1.7 1.7 0 0 0-.3 1.8V9a1.7 1.7 0 0 0 1.5 1H21a2 2 0 1 1 0 4h-.1a1.7 1.7 0 0 0-1.5 1z"/>'};
+const PAGES=[['home','首页'],['in','节点'],['users','用户'],['out','出站'],['cert','证书'],'|',['route','路由规则'],['dns','DNS'],['sub','订阅'],'|',['ver','版本'],['log','日志'],['set','设置']];
+let CUR='home';
+function renderNav(){$('nav').innerHTML=PAGES.map(p=>p==='|'?'<div class="sep"></div>':
+ `<a data-p="${p[0]}" onclick="go('${p[0]}')"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">${IC[p[0]]}</svg>${p[1]}</a>`).join('')}
+function sideOpen(v){$('side').classList.toggle('open',!!v);$('mask').classList.toggle('show',!!v)}
+function go(p){if(CUR==='route'&&p!=='route'&&RT&&RT.dirty&&!confirm('路由规则有未保存的修改，确定离开？'))return;
+ if(CUR==='dns'&&p!=='dns'&&DN&&DN.dirty&&!confirm('DNS 有未保存的修改，确定离开？'))return;
+ CUR=p;sideOpen(0);try{localStorage.setItem('pg',p)}catch(e){}
+ document.querySelectorAll('.nav a').forEach(a=>a.classList.toggle('active',a.dataset.p===p));
+ PAGES.forEach(x=>{if(x!=='|')$('p-'+x[0]).style.display=x[0]===p?'block':'none'});
+ $('ptitle').textContent=(PAGES.find(x=>x[0]===p)||[0,''])[1];
+ if(p==='home')loadHome();if(p==='in')loadIn();if(p==='users')loadUsers();if(p==='out')loadOut();
+ if(p==='cert')loadCerts();if(p==='route')loadRoute();if(p==='dns')loadDns();if(p==='sub')loadSub();
+ if(p==='ver')loadVer();if(p==='log'){loadLog();loadHealth()}if(p==='set')loadSet()}
+
+function show(in_){$('login').style.display=in_?'none':'block';$('app').style.display=in_?'block':'none';
+ if(in_){renderNav();refresh();startPoll();let pg='home';try{pg=localStorage.getItem('pg')||'home'}catch(e){}
+  go(PAGES.some(x=>x[0]===pg)?pg:'home')}else stopPoll()}
+async function doLogin(){const pw=$('pw').value,us=$('usr').value;
+ const r=await(await fetch(BASE+'/api/login',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({username:us,password:pw})})).json();
+ if(r.ok){TK=r.token;localStorage.setItem('tk',TK);show(1)}else msg('用户名或密码错误')}
+function logout(){TK='';localStorage.removeItem('tk');show(0)}
+async function refresh(){const s=await api('/status');
+ $('stat').innerHTML=`<span><span class="dot ${s.running?'on':'off'}"></span>${s.running?'运行中':'已停止'}</span><span>版本 <b>${esc(s.version)}</b></span><span>IP <b>${esc(s.ip)}</b></span>`;
+ $('sidefoot').innerHTML=`sing-box ${esc(s.version)} · 节点 ${s.inbounds} · 出站 ${s.outbounds}`;
+ PROTOS=await api('/protocols');loadHealth()}
+let _hTimer=null,_dTimer=null;
+function startPoll(){stopPoll();_hTimer=setInterval(()=>{if(TK)loadHealth().catch(()=>{})},60000);
+ _dTimer=setInterval(()=>{if(TK&&CUR==='home'&&!document.hidden)loadHome(1).catch(()=>{})},3000)}
+function stopPoll(){if(_hTimer)clearInterval(_hTimer);if(_dTimer)clearInterval(_dTimer);_hTimer=_dTimer=null}
+
+// ════════ 首页仪表盘 ════════
+function gauge(label,pct,sub,color){pct=Math.max(0,Math.min(100,pct||0));const C=2*Math.PI*30,off=C*(1-pct/100);
+ const col=color||(pct>=90?'var(--err)':pct>=70?'var(--warn)':'var(--pri)');
+ return `<div class="card gauge"><svg viewBox="0 0 74 74"><circle cx="37" cy="37" r="30" fill="none" stroke="var(--line)" stroke-width="7"/>
+  <circle cx="37" cy="37" r="30" fill="none" stroke="${col}" stroke-width="7" stroke-linecap="round" stroke-dasharray="${C.toFixed(1)}" stroke-dashoffset="${off.toFixed(1)}" transform="rotate(-90 37 37)" style="transition:stroke-dashoffset .6s"/>
+  <text x="37" y="42" text-anchor="middle" fill="var(--tx)" font-size="15" font-weight="650">${Math.round(pct)}%</text></svg>
+  <div class="gt"><b>${label}</b><span>${sub||''}</span></div></div>`}
+function chart(series,colors,fmtMax){// series: [[v...],...]
+ const W=600,H=120,n=Math.max(2,...series.map(s=>s.length));let mx=0;series.forEach(s=>s.forEach(v=>mx=Math.max(mx,v||0)));
+ const top=mx>0?mx*1.15:1;const x=i=>(i/(n-1))*W,y=v=>H-6-((v||0)/top)*(H-14);
+ let g='';for(let k=1;k<4;k++)g+=`<line x1="0" x2="${W}" y1="${k*H/4}" y2="${k*H/4}" stroke="var(--line)" stroke-width="1"/>`;
+ const paths=series.map((s,j)=>{if(!s.length)return'';const off=n-s.length;const pts=s.map((v,i)=>`${x(i+off).toFixed(1)},${y(v).toFixed(1)}`);
+  return `<path d="M${x(off)},${H} L${pts.join(' L')} L${x(n-1)},${H} Z" fill="${colors[j]}" opacity=".12"/><polyline points="${pts.join(' ')}" fill="none" stroke="${colors[j]}" stroke-width="2" stroke-linejoin="round"/>`}).join('');
+ return `<svg class="chart" viewBox="0 0 ${W} ${H}" preserveAspectRatio="none">${g}${paths}<text x="6" y="14" fill="var(--tx3)" font-size="11">${fmtMax?fmtMax(mx):Math.round(mx)}</text></svg>`}
+async function loadHome(silent){const box=$('p-home');
+ if(!silent&&!box.innerHTML)box.innerHTML='<div class="card"><div class="scanning">加载中…</div></div>';
+ let d;try{d=await api('/dashboard')}catch(e){return}
+ if(CUR!=='home')return;
+ const s=d.sys||{},sb=d.sb||{},st=d.stats||{};
+ const mem=s.mem||{},dsk=s.disk||{},swp=s.swap||{};
+ const pc=(o)=>o&&o.total?100*o.used/o.total:0;
+ const h=d.hist||[],sh=st.hist||[];
+ let mode='';
+ if(st.disabled)mode='<span class="badge">已关闭</span>';
+ else if(!st.ok)mode=`<span class="badge r" title="${esc(st.err)}">Clash API 不可用</span>`;
+ else mode=st.mode==='iptables'?'<span class="badge g" title="内核按端口计数，不漏短连接">精确计数</span>':`<span class="badge y" title="${esc(st.acct_err||'')}：轮询连接估算，短连接可能漏算">估算</span>`;
+ const nodes=d.nodes||[];
+ box.innerHTML=`<div class="tiles">
+   ${gauge('CPU',s.cpu,`${s.cores||'?'} 核 · 负载 ${(s.load||[]).join(' / ')||'—'}`)}
+   ${gauge('内存',pc(mem),mem.total?`${fmtB(mem.used)} / ${fmtB(mem.total)}`:'—')}
+   ${gauge('硬盘',pc(dsk),dsk.total?`${fmtB(dsk.used)} / ${fmtB(dsk.total)}`:'—')}
+   ${gauge('交换区',pc(swp),swp.total?`${fmtB(swp.used)} / ${fmtB(swp.total)}`:'未启用','#8b5cf6')}
+  </div>
+  <div class="grid2">
+   <div class="card"><h3>服务器网速<span class="sp"></span><span class="num" style="font-size:12.5px;color:var(--tx2)">↓ <b style="color:#60a5fa">${fmtR(s.rx||0)}</b> &nbsp; ↑ <b style="color:#34d399">${fmtR(s.tx||0)}</b></span></h3>
+    ${chart([h.map(x=>x[3]),h.map(x=>x[4])],['#60a5fa','#34d399'],v=>fmtR(v))}
+    <div class="legend"><span><i style="background:#60a5fa"></i>下行</span><span><i style="background:#34d399"></i>上行</span><span class="mut">开机以来 ↓ ${fmtB(s.rx_total)} · ↑ ${fmtB(s.tx_total)}</span></div></div>
+   <div class="card"><h3>CPU / 内存<span class="sp"></span><span class="num" style="font-size:12.5px;color:var(--tx2)">CPU <b>${s.cpu==null?'—':s.cpu+'%'}</b> &nbsp; 内存 <b>${Math.round(pc(mem))}%</b></span></h3>
+    ${chart([h.map(x=>x[1]),h.map(x=>x[2])],['#f59e0b','#a78bfa'],v=>Math.round(v)+'%')}
+    <div class="legend"><span><i style="background:#f59e0b"></i>CPU</span><span><i style="background:#a78bfa"></i>内存</span><span class="mut">最近 ${h.length*3<60?h.length*3+' 秒':Math.round(h.length*3/60)+' 分钟'}</span></div></div>
+  </div>
+  <div class="grid2">
+   <div class="card"><h3>系统信息</h3>
+    <div class="row"><span>主机名</span><span>${esc(s.host||'—')}</span></div>
+    <div class="row"><span>系统</span><span>${esc(s.os||'—')}</span></div>
+    <div class="row"><span>内核 / 架构</span><span>${esc(s.kernel||'—')} · ${esc(s.arch||'')}</span></div>
+    <div class="row"><span>CPU</span><span>${esc(s.cpu_model||'—')} · ${s.cores||'?'} 核</span></div>
+    <div class="row"><span>公网 IP</span><span>${esc(s.ip||'—')}</span></div>
+    <div class="row"><span>已运行</span><span>${fmtDur(s.uptime)}</span></div></div>
+   <div class="card"><h3>sing-box <span class="badge ${sb.running?'g':'r'}">${sb.running?'运行中':'已停止'}</span><span class="sp"></span><button class="btn2 sm" onclick="restart()">重启</button></h3>
+    <div class="row"><span>版本</span><span>${esc(sb.version||'—')}</span></div>
+    <div class="row"><span>内存占用</span><span>${sb.rss?fmtB(sb.rss):'—'}</span></div>
+    <div class="row"><span>已运行</span><span>${fmtDur(sb.uptime)}</span></div>
+    <div class="row"><span>当前连接</span><span class="num">${sb.conns||0}</span></div>
+    <div class="row"><span>用户</span><span>${(d.users||{}).active||0} 启用 / ${(d.users||{}).total||0} 总数</span></div>
+    <div class="row"><span>代理网速</span><span class="num">↓ ${fmtR((st.rate||{}).down||0)} · ↑ ${fmtR((st.rate||{}).up||0)}</span></div></div>
+  </div>
+  <div class="card"><h3>节点流量 ${mode}<span class="sp"></span><button class="btn2 sm" onclick="resetStats('')">全部清零</button></h3>
+   ${nodes.length?`<div class="tw"><table class="tbl"><tr><th>节点</th><th>协议</th><th>端口</th><th>用户</th><th>连接</th><th>在线 IP</th><th>实时 ↓ / ↑</th><th>累计 ↓ / ↑</th><th></th></tr>
+   ${nodes.map(n=>`<tr><td>${esc(n.name)}<div class="mut" style="font-size:11.5px">${esc(n.tag)}</div></td><td>${esc(n.proto)}</td><td class="num">${n.port||''}</td>
+    <td class="num">${n.users==null?'<span class="mut" title="该协议不支持多用户">—</span>':n.users}</td><td class="num">${n.conns}</td><td class="num">${n.ips}</td>
+    <td class="num">${fmtR(n.down_rate)}<br><span class="mut">${fmtR(n.up_rate)}</span></td>
+    <td class="num"><b>${fmtB(n.down)}</b><br><span class="mut">${fmtB(n.up)}</span></td>
+    <td><button class="ib" title="清零" onclick="resetStats('${esc(n.tag)}')">清零</button></td></tr>`).join('')}</table></div>`
+   :'<div class="empty">还没有节点</div>'}
+   <p class="mut" style="font-size:12px;margin-top:10px">按节点统计。按用户统计需要把 sing-box 编译进面板（s-ui 的做法），那样就不能自选 sing-box 版本，所以这里不提供。</p></div>`}
+async function resetStats(tag){if(!confirm(tag?`清零节点 ${tag} 的累计流量？`:'清零全部节点的累计流量？'))return;
+ const r=await api('/stats-reset','POST',{tag});msg(r.msg,r.ok);loadHome()}
+
+// ════════ 节点 ════════
 async function loadIn(){const l=await api('/inbounds');OUTS=await api('/outbounds');
- document.getElementById('inlist').innerHTML=l.length?l.map(n=>`<div class="card"><h3>${esc(n.name)}<span class="badge">${n.type}</span></h3>
-  <div class="row"><span>标签</span><span>${n.tag}</span></div>
-  <div class="row"><span>端口</span><span>${n.port}</span></div>
+ $('inlist').innerHTML=l.length?l.map(n=>`<div class="card"><h3>${esc(n.name)}<span class="badge">${esc(n.proto||n.type)}</span>${n.conns?`<span class="badge g">${n.conns} 连接</span>`:''}</h3>
+  <div class="row"><span>标签 / 端口</span><span>${esc(n.tag)} · ${n.port}</span></div>
   <div class="row"><span>出站</span><span>${n.bind==='direct'?'直连':esc(n.bind)}</span></div>
-  ${n.uri?`<div class="uri" onclick="cp(this.textContent)">${esc(n.uri)}</div>`:''}
+  <div class="row"><span>用户</span><span>${n.multi?(n.users.length?`${n.active_users} 启用 / ${n.users.length} 分配`:'<span class="mut">仅原有用户</span>'):'<span class="mut">不支持多用户</span>'}</span></div>
+  <div class="row"><span>累计流量</span><span class="num">↓ ${fmtB(n.down)} · ↑ ${fmtB(n.up)}</span></div>
+  ${n.uri?`<div class="uri" onclick="cp(this.textContent)" title="点击复制">${esc(n.uri)}</div>`:''}
   <div class="acts"><button class="btn2" onclick="editNode('${encodeURIComponent(n.tag)}')">编辑</button>
   <button class="btn2" onclick="bindDlg('${encodeURIComponent(n.tag)}','${encodeURIComponent(n.bind)}')">绑定出站</button>
   <button class="btnd" onclick="delIn('${encodeURIComponent(n.tag)}')">删除</button></div></div>`).join(''):'<div class="empty">还没有节点，点上方添加</div>'}
+
+// 节点弹窗：按 s-ui 分「服务端 / 客户端」两页
+const CLIENT_KEYS=['server','hop'];
+const TRKEYS=['transport','tr_path','tr_host','tr_ed'];
+function nodeModal(title,protoSel,nameVal,saveBtn){
+ return `<h2>${title}</h2>
+  <div class="f2"><div>${protoSel}</div><div><label>节点名称</label><input id="f-name" value="${esc(nameVal)}"></div></div>
+  <div class="mtabs"><div class="mtab active" data-t="s" onclick="mtab('s')">服务端</div><div class="mtab" data-t="c" onclick="mtab('c')">客户端</div></div>
+  <div id="mt-s"><div id="fs"></div><div id="fu"></div><div id="fa"></div></div>
+  <div id="mt-c" style="display:none"><div id="fc"></div></div>
+  <div class="acts">${saveBtn}<button class="btn2" onclick="closeM()">取消</button></div>`}
+function mtab(t){document.querySelectorAll('.mtab').forEach(e=>e.classList.toggle('active',e.dataset.t===t));
+ document.querySelectorAll('[id^="mt-"]').forEach(e=>e.style.display=e.id==='mt-'+t?'block':'none')}
+async function fillNode(proto,gv,assigned,uri){const spec=PROTOS[proto];
+ if(spec.needs_cert&&!CERTS.length){const cr=await api('/certs');CERTS=cr.certs||[]}
+ const sf=spec.fields.filter(f=>f.k!=='name'&&CLIENT_KEYS.indexOf(f.k)<0),cf=spec.fields.filter(f=>CLIENT_KEYS.indexOf(f.k)>=0);
+ $('fs').innerHTML=sf.map(f=>fld(f,gv(f))).join('');
+ $('fa').innerHTML=advHTML(spec,gv);
+ $('fc').innerHTML=(cf.length?cf.map(f=>fld(f,gv(f))).join(''):'')
+  +`<div class="note" style="margin-top:14px">分享链接里的连接地址${spec.needs_cert?'使用证书域名':'使用上面填写的地址'}。每个用户的链接与此相同，只是凭据换成他自己的。</div>`
+  +(uri?`<label>当前分享链接（原有用户）</label><div class="uri" onclick="cp(this.textContent)">${esc(uri)}</div>`:'');
+ if(!USERS){try{USERS=await api('/users')}catch(e){USERS={users:[]}}}
+ const multi=['hysteria2','vless','vless-tls','trojan','anytls','tuic','vmess','hysteria','naive','socks','mixed','http'].indexOf(proto)>=0;
+ const us=USERS.users||[];
+ $('fu').innerHTML=`<label>用户 <span class="hint">节点原有的用户始终保留；这里勾选面板里的其他用户</span></label>`+
+  (!multi?`<div class="alert" style="margin:0">${esc(spec.label)} 不支持多用户：开启后原有链接会失效</div>`
+  :us.length?`<div class="chkbox">${us.map(u=>`<label class="chk"><input type="checkbox" class="nu" value="${esc(u.name)}" ${assigned.indexOf(u.name)>=0?'checked':''}>
+    <span>${esc(u.name)}</span><i>${u.group?esc(u.group)+' · ':''}${u.active?'启用':(u.expired?'已过期':'已停用')}</i></label>`).join('')}</div>`
+  :`<div class="mut" style="font-size:12.5px">还没有用户，可在「用户」页添加</div>`)}
+function pickedUsers(){const e=document.querySelectorAll('.nu');return e.length||document.querySelector('#fu .chkbox')?[...e].filter(x=>x.checked).map(x=>x.value):undefined}
+async function newNode(){const opts=Object.entries(PROTOS).map(([k,v])=>`<option value="${k}">${esc(v.label)}</option>`).join('');
+ USERS=null;
+ openM(nodeModal('添加节点',`<label>协议</label><select id="proto" onchange="renderF()">${opts}</select>`,'',`<button onclick="saveNode(this)">创建</button>`),1);renderF()}
+async function renderF(){const p=$('proto').value,spec=PROTOS[p];
+ const a=await api('/autofill');const gv=f=>f.auto?(a[f.auto]||''):(f.d||'');
+ $('f-name').value=(spec.fields.find(f=>f.k==='name')||{}).d||'';
+ await fillNode(p,gv,[],'')}
+async function editNode(t0){const t=decodeURIComponent(t0);
+ const d=await api('/inbound-detail/'+encodeURIComponent(t));
+ if(!d.ok)return msg(d.msg||'读取失败');
+ const spec=PROTOS[d.proto];if(!spec)return msg('未知协议');
+ USERS=null;
+ openM(nodeModal(`编辑节点`,`<label>协议 <span class="hint">不可更改</span></label><input value="${esc(spec.label)}" disabled>`,d.name,
+  `<button onclick="saveEdit(this,'${encodeURIComponent(t)}','${d.proto}')">保存</button>`),1);
+ const gv=f=>d.fields[f.k]!==undefined?String(d.fields[f.k]):(f.d||'');
+ const nodes=await api('/inbounds');const n=nodes.find(x=>x.tag===t)||{};
+ await fillNode(d.proto,gv,d.users||[],n.uri||'')}
+function fld(f,v){v=v===undefined?'':String(v);
+ const h=f.h?`<span class="hint">${esc(f.h)}</span>`:'';
+ if(f.t==='bool')return `<label class="chk"><input type="checkbox" id="f-${f.k}" ${v==='1'?'checked':''}><span>${esc(f.l)}</span>${f.h?`<i>${esc(f.h)}</i>`:''}</label>`;
+ if(f.t==='cert'){const o=CERTS.map(c=>`<option value="${esc(c.domain)}" ${c.domain===v?'selected':''}>${esc(c.domain)}</option>`).join('');
+  return `<label>${esc(f.l)}${h}</label>`+(CERTS.length?`<select id="f-${f.k}">${o}</select>`:`<div class="alert">无可用证书，请先到「证书」页申请</div>`)}
+ if(f.t==='select')return `<label>${esc(f.l)}${h}</label><select id="f-${f.k}">${f.opts.map(o=>`<option ${o===v?'selected':''}>${esc(o)}</option>`).join('')}</select>`;
+ if(f.t==='dest')return `<label>${esc(f.l)} <a href="javascript:;" onclick="scanDest()">⚡ 扫描可用目标</a></label>
+  <input id="f-${f.k}" type="text" value="${esc(v)}"><div id="scanres"></div>`;
+ return `<label>${esc(f.l)}${h}</label><input id="f-${f.k}" type="${f.t}" value="${esc(v)}">`}
+function advHTML(spec,gv){const a=spec.adv||[];if(!a.length)return '';
+ const perf=a.filter(f=>TRKEYS.indexOf(f.k)<0),tr=a.filter(f=>TRKEYS.indexOf(f.k)>=0);
+ let out='';
+ if(perf.length)out+=`<details><summary>高级选项 · 性能与抗封锁（${perf.length}）</summary><div class="dbody">${perf.map(f=>fld(f,gv(f))).join('')}</div></details>`;
+ if(tr.length)out+=`<details><summary>传输层设置（可过 CDN）</summary><div class="dbody">${tr.map(f=>fld(f,gv(f))).join('')}</div></details>`;
+ return out}
+function collectF(spec){const fs={};
+ (spec.fields||[]).concat(spec.adv||[]).forEach(f=>{const e=$('f-'+f.k);
+  if(e)fs[f.k]=(f.t==='bool')?(e.checked?'1':'0'):e.value});
+ return fs}
+async function scanDest(){const box=$('scanres');
+ box.innerHTML='<div class="scanning">扫描中，约 8 秒…</div>';
+ const r=await api('/scan');
+ box.innerHTML=`<div class="scanlist">`+r.map(x=>{const cls=x.ok?'sok':'sbad';
+   const info=x.ok?`${x.ms}ms · TLS1.3 · H2${x.issuer?' · '+esc(x.issuer):''}`:esc(x.err||'不可用');
+   return `<div class="scanrow ${cls}" ${x.ok?`onclick="pickDest('${esc(x.host)}')"`:''}><span>${esc(x.host)}</span><b>${info}</b></div>`}).join('')+`</div>
+   <div class="mut" style="font-size:12px;margin-top:6px">点击绿色条目即可选用（需 TLS1.3 + H2 才合格）</div>`}
+function pickDest(h){$('f-dest').value=h;$('scanres').innerHTML='';msg('已选用 '+h,1)}
+async function saveNode(b){const p=$('proto').value;const fs=collectF(PROTOS[p]);
+ b.disabled=true;b.textContent='创建中…';
+ const r=await api('/inbounds','POST',{proto:p,fields:fs,users:pickedUsers()});
+ b.disabled=false;b.textContent='创建';
+ if(r.ok){closeM();msg('节点已创建',1);loadIn();refresh()}else msg(r.msg)}
+async function saveEdit(b,t0,proto){const t=decodeURIComponent(t0);const fs=collectF(PROTOS[proto]);
+ b.disabled=true;b.textContent='保存中…';
+ const r=await api('/inbound-edit/'+encodeURIComponent(t),'POST',{proto,fields:fs,users:pickedUsers()});
+ b.disabled=false;b.textContent='保存';
+ if(r.ok){closeM();msg('已保存，客户端需重新拉订阅',1);loadIn();refresh()}else msg(r.msg)}
+async function delIn(t0){const t=decodeURIComponent(t0);if(!confirm('删除节点 '+t+'？分配给它的用户会自动解除。'))return;
+ const r=await api('/inbounds/'+encodeURIComponent(t),'DELETE');
+ if(r.ok){msg('已删除',1);loadIn();refresh()}else msg(r.msg)}
+
+// ════════ 用户（参照 s-ui Clients）════════
+let UF={q:'',g:'-',s:''},USEL=new Set();
+async function loadUsers(){USERS=await api('/users');renderUsers()}
+function renderUsers(){const box=$('p-users'),d=USERS||{users:[]};const us=d.users;
+ const groups=[...new Set(us.map(u=>u.group||''))].sort();
+ const q=UF.q.toLowerCase();
+ const list=us.filter(u=>(!q||u.name.toLowerCase().includes(q)||(u.remark||'').toLowerCase().includes(q))
+  &&(UF.g==='-'||(u.group||'')===UF.g)
+  &&(!UF.s||(UF.s==='on'&&u.active)||(UF.s==='off'&&!u.enable)||(UF.s==='exp'&&u.expired)));
+ const nn=t=>{const n=(d.nodes||[]).find(x=>x.tag===t);return n?n.name:t};
+ box.innerHTML=`<div class="bar"><button onclick="userDlg('')">+ 添加用户</button><button class="btn2" onclick="bulkDlg()">批量添加</button>
+  <button class="btnd" ${USEL.size?'':'disabled'} onclick="bulkDel()">删除所选${USEL.size?` (${USEL.size})`:''}</button>
+  <span class="sp"></span>
+  <input placeholder="搜索用户名 / 备注" value="${esc(UF.q)}" oninput="UF.q=this.value;renderUsers();this.focus();this.setSelectionRange(this.value.length,this.value.length)" style="width:170px">
+  <select onchange="UF.g=this.value;renderUsers()"><option value="-">全部分组</option>${groups.map(g=>`<option value="${esc(g)}" ${UF.g===g?'selected':''}>${g?esc(g):'(未分组)'}</option>`).join('')}</select>
+  <select onchange="UF.s=this.value;renderUsers()"><option value="">全部状态</option><option value="on" ${UF.s==='on'?'selected':''}>生效中</option><option value="off" ${UF.s==='off'?'selected':''}>已停用</option><option value="exp" ${UF.s==='exp'?'selected':''}>已过期</option></select></div>
+  <div class="card">${us.length?`<div class="tw"><table class="tbl"><tr><th><input type="checkbox" onchange="selAll(this.checked)" ${list.length&&list.every(u=>USEL.has(u.name))?'checked':''}></th><th>用户名</th><th>启用</th><th>分组</th><th>节点</th><th>到期</th><th>创建时间</th><th>备注</th><th></th></tr>
+   ${list.map(u=>`<tr><td><input type="checkbox" ${USEL.has(u.name)?'checked':''} onchange="selU('${esc(u.name)}',this.checked)"></td>
+    <td><b>${esc(u.name)}</b>${!u.active&&u.enable&&u.expired?'':''}</td>
+    <td><label class="sw" title="${u.enable?'点击停用':'点击启用'}"><input type="checkbox" ${u.enable?'checked':''} onchange="toggleU('${esc(u.name)}',this.checked,this)"><span></span></label></td>
+    <td>${u.group?`<span class="badge b">${esc(u.group)}</span>`:'<span class="mut">—</span>'}</td>
+    <td title="${esc((u.inbounds||[]).map(nn).join('、'))}">${(u.inbounds||[]).length?`${u.inbounds.length} 个`:'<span class="mut">未分配</span>'}</td>
+    <td>${expTxt(u)}</td><td class="mut num">${fmtTs(u.created)}</td>
+    <td class="mut" style="max-width:160px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(u.remark||'')}</td>
+    <td style="white-space:nowrap"><button class="ib" onclick="userDlg('${esc(u.name)}','l')">链接</button><button class="ib" onclick="userDlg('${esc(u.name)}')">编辑</button><button class="ib" style="color:var(--err)" onclick="delUser('${esc(u.name)}')">删除</button></td></tr>`).join('')}
+   </table></div>${list.length?'':'<div class="empty">没有符合筛选条件的用户</div>'}`
+  :'<div class="empty">还没有用户。<br>用户可以分配到多个节点，每人一个独立的订阅链接，到期自动停用。</div>'}</div>
+  <p class="mut" style="font-size:12px">停用或到期的用户会自动从节点里移除，他的订阅链接返回 404。节点建立时的原有用户不受影响。</p>`}
+function selU(n,v){v?USEL.add(n):USEL.delete(n);renderUsers()}
+function selAll(v){const q=UF.q.toLowerCase();(USERS.users||[]).forEach(u=>{if(v)USEL.add(u.name);else USEL.delete(u.name)});renderUsers()}
+async function toggleU(n,on,el){const u=USERS.users.find(x=>x.name===n);if(!u)return;el.disabled=true;
+ const r=await api('/user-edit/'+encodeURIComponent(n),'POST',Object.assign({},u,{enable:on}));
+ msg(r.ok?(on?'已启用':'已停用'):r.msg,r.ok);loadUsers()}
+async function delUser(n){if(!confirm(`删除用户 ${n}？他的订阅链接立即失效。`))return;
+ const r=await api('/users/'+encodeURIComponent(n),'DELETE');msg(r.msg,r.ok);USEL.delete(n);loadUsers()}
+async function bulkDel(){const ns=[...USEL];if(!ns.length)return;if(!confirm(`删除所选 ${ns.length} 个用户？`))return;
+ const r=await api('/users-del','POST',{names:ns});msg(r.msg,r.ok);USEL.clear();loadUsers()}
+function nodePicker(sel){const ns=(USERS.nodes||[]);
+ if(!ns.length)return '<div class="mut" style="font-size:12.5px">还没有节点</div>';
+ return `<div class="chkbox">${ns.map(n=>`<label class="chk ${n.multi?'':'dis'}"><input type="checkbox" class="un" value="${esc(n.tag)}" ${sel.indexOf(n.tag)>=0?'checked':''} ${n.multi?'':'disabled'}>
+   <span>${esc(n.name)}</span><i>${esc(n.proto)}${n.multi?'':' · 不支持多用户'}</i></label>`).join('')}</div>
+   <div style="font-size:12px;margin-top:4px"><a href="javascript:;" onclick="document.querySelectorAll('.un:not(:disabled)').forEach(e=>e.checked=true)">全选</a> / <a href="javascript:;" onclick="document.querySelectorAll('.un').forEach(e=>e.checked=false)">清空</a></div>`}
+function expField(ts){return `<label>到期时间 <span class="hint">留空为永久</span></label>
+ <input type="datetime-local" id="u-exp" value="${toLocalInput(ts)}">
+ <div style="display:flex;gap:6px;margin-top:6px;flex-wrap:wrap">${[['永久',0],['7 天',7],['30 天',30],['90 天',90],['半年',182],['1 年',365]].map(([l,d])=>
+  `<button class="btn2 sm" type="button" onclick="setExp(${d})">${l}</button>`).join('')}</div>`}
+function setExp(days){$('u-exp').value=days?toLocalInput(Math.floor(Date.now()/1000)+days*86400):''}
+function readExp(){const v=$('u-exp').value;return v?Math.floor(new Date(v).getTime()/1000):0}
+async function userDlg(name,tab){if(!USERS)USERS=await api('/users');
+ const u=name?USERS.users.find(x=>x.name===name):null;if(name&&!u)return msg('用户不存在');
+ const x=u||{enable:true,inbounds:(USERS.nodes||[]).filter(n=>n.multi).map(n=>n.tag)};
+ openM(`<h2>${u?'编辑用户 · '+esc(u.name):'添加用户'}</h2>
+  ${u?`<div class="mtabs"><div class="mtab ${tab!=='l'?'active':''}" data-t="b" onclick="mtab('b')">基本</div><div class="mtab ${tab==='l'?'active':''}" data-t="l" onclick="mtab('l');userLinks('${esc(u.name)}')">链接</div></div>`:''}
+  <div id="mt-b" style="${tab==='l'?'display:none':''}">
+  <div class="f2"><div><label>用户名 <span class="hint">字母数字 . _ -</span></label><input id="u-name" value="${esc(x.name||'')}" maxlength="32"></div>
+   <div><label>分组</label><input id="u-group" value="${esc(x.group||'')}" placeholder="可选" list="u-groups"><datalist id="u-groups">${[...new Set(USERS.users.map(v=>v.group).filter(Boolean))].map(g=>`<option value="${esc(g)}">`).join('')}</datalist></div></div>
+  <label class="chk" style="margin-top:10px"><input type="checkbox" id="u-en" ${x.enable!==false?'checked':''}><span>启用</span><i>停用后立即从节点移除，订阅返回 404</i></label>
+  ${expField(x.expiry)}
+  <label>备注</label><input id="u-remark" value="${esc(x.remark||'')}" placeholder="可选">
+  <label>分配节点</label>${nodePicker(x.inbounds||[])}
+  <details ${u?'':''}><summary>凭据 · UUID 与密码（留空自动生成）</summary><div class="dbody">
+   <label>UUID <span class="hint">VLESS / VMess / TUIC 使用</span></label><input id="u-uuid" value="${esc(x.uuid||'')}" placeholder="自动生成">
+   <label>密码 <span class="hint">其余协议使用</span></label><input id="u-pass" value="${esc(x.password||'')}" placeholder="自动生成">
+   ${u?`<div class="acts"><button class="btn2 sm" onclick="resetU('${esc(u.name)}','cred')">重新生成凭据</button></div>`:''}</div></details>
+  <div class="acts"><button onclick="saveUser(this,'${esc(name||'')}')">${u?'保存':'添加'}</button><button class="btn2" onclick="closeM()">取消</button></div></div>
+  ${u?`<div id="mt-l" style="${tab==='l'?'':'display:none'}"><div class="scanning">加载中…</div></div>`:''}`,1);
+ if(u&&tab==='l')userLinks(u.name)}
+async function userLinks(n){const r=await api('/user-links/'+encodeURIComponent(n));const box=$('mt-l');if(!box)return;
+ if(!r.ok){box.innerHTML=`<div class="alert">${esc(r.msg)}</div>`;return}
+ const u=USERS.users.find(x=>x.name===n)||{};
+ box.innerHTML=`${u.active?'':'<div class="alert">该用户当前未生效（已停用或已过期），订阅会返回 404，节点也不接受他的连接</div>'}
+  <label>订阅链接 <span class="hint">点击复制 · 只包含分配给他的节点</span></label>
+  <div class="uri" onclick="cp(this.textContent)">${esc(r.sub)}</div>
+  <div class="acts"><button class="btn2 sm" onclick="window.open('${esc(r.sub)}?plain=1')">查看明文</button><button class="btn2 sm" onclick="resetU('${esc(n)}','sub')">更换订阅地址</button></div>
+  <label style="margin-top:16px">各节点链接（${r.links.length}）</label>
+  ${r.links.length?r.links.map(l=>`<div style="margin-top:8px;font-size:12.5px;color:var(--tx2)">${esc(l.name)} <span class="mut">${esc(l.tag)}</span></div><div class="uri" style="margin-top:4px" onclick="cp(this.textContent)">${esc(l.uri)}</div>`).join('')
+   :'<div class="mut" style="font-size:12.5px">没有分配支持多用户的节点</div>'}`}
+async function saveUser(b,old){const ins=[...document.querySelectorAll('.un:checked')].map(e=>e.value);
+ const body={name:$('u-name').value.trim(),group:$('u-group').value.trim(),enable:$('u-en').checked,expiry:readExp(),
+  remark:$('u-remark').value.trim(),inbounds:ins,uuid:$('u-uuid').value.trim(),password:$('u-pass').value.trim()};
+ b.disabled=true;
+ const r=old?await api('/user-edit/'+encodeURIComponent(old),'POST',body):await api('/users','POST',body);
+ b.disabled=false;
+ if(r.ok){closeM();msg(r.msg,1);loadUsers()}else msg(r.msg)}
+async function resetU(n,what){if(!confirm(what==='sub'?'更换订阅地址后旧地址立即失效，确定？':'重新生成 UUID 和密码？他需要重新拉订阅才能继续使用。'))return;
+ const r=await api('/user-reset/'+encodeURIComponent(n),'POST',{what});msg(r.msg,r.ok);
+ if(r.ok){USERS=await api('/users');if(what==='sub')userLinks(n);else{closeM();renderUsers()}}}
+function bulkDlg(){openM(`<h2>批量添加用户</h2>
+  <div class="f3"><div><label>数量</label><input id="b-n" type="number" min="1" max="200" value="10"></div>
+   <div><label>用户名前缀</label><input id="b-p" value="user"></div><div><label>起始编号</label><input id="b-s" type="number" value="1"></div></div>
+  <p class="mut" style="font-size:12px;margin-top:6px">将生成 user1、user2…，已存在的名字自动跳过</p>
+  <label>分组</label><input id="u-group" placeholder="可选">
+  ${expField(0)}
+  <label>分配节点</label>${nodePicker((USERS.nodes||[]).filter(n=>n.multi).map(n=>n.tag))}
+  <div class="acts"><button onclick="saveBulk(this)">添加</button><button class="btn2" onclick="closeM()">取消</button></div>`,1)}
+async function saveBulk(b){b.disabled=true;
+ const r=await api('/users-bulk','POST',{count:+$('b-n').value,prefix:$('b-p').value.trim(),start:+$('b-s').value,
+  group:$('u-group').value.trim(),expiry:readExp(),inbounds:[...document.querySelectorAll('.un:checked')].map(e=>e.value)});
+ b.disabled=false;if(r.ok){closeM();msg(r.msg,1);loadUsers()}else msg(r.msg)}
+
+// ════════ 出站 / 证书 / 订阅 / 版本 / 日志（沿用原逻辑）════════
 async function loadOut(){OUTS=await api('/outbounds');
- document.getElementById('outlist').innerHTML=OUTS.length?OUTS.map(o=>`<div class="card"><h3>${esc(o.tag)}<span class="badge">${o.type}</span></h3>
-  <div class="row"><span>地址</span><span>${o.server}</span></div>
-  <div class="row"><span>端口</span><span>${o.port}</span></div>
+ $('outlist').innerHTML=OUTS.length?OUTS.map(o=>`<div class="card"><h3>${esc(o.tag)}<span class="badge">${esc(o.type)}</span></h3>
+  <div class="row"><span>地址</span><span>${esc(o.server)}</span></div>
+  <div class="row"><span>端口</span><span>${esc(o.port)}</span></div>
   <div class="row"><span>协议</span><span>${o.type==='http'?(o.tls?'HTTPS':'HTTP'):'SOCKS5'}${o.auth?' · 已认证':' · 无认证'}</span></div>
   <div class="row"><span>状态</span><span id="t-${esc(o.tag)}">-</span></div>
   <div class="row"><span>延迟</span><span id="sp-${esc(o.tag)}">-</span></div>
@@ -2728,482 +4093,510 @@ async function loadOut(){OUTS=await api('/outbounds');
 async function loadCerts(){const r=await api('/certs');CERTS=r.certs||[];
  const cur=r.panel_tls||'';
  let head=`<div class="card" style="grid-column:1/-1"><h3>面板访问方式</h3>
-   <div class="row"><span>当前</span><span>${cur?`<b style="color:#3ddc84">https://${esc(cur)}:${r.panel_port}</b>`:`http://127.0.0.1:${r.panel_port} <i style="color:#6b7280;font-style:normal">(仅本机，需 SSH 隧道)</i>`}</span></div>
+   <div class="row"><span>当前</span><span>${cur?`<b style="color:var(--ok)">https://${esc(cur)}:${r.panel_port}</b>`:`http://127.0.0.1:${r.panel_port} <i class="mut" style="font-style:normal">(仅本机，需 SSH 隧道)</i>`}</span></div>
    <div class="acts"><button class="btn2" onclick="pathDlg()">更换访问路径</button>
    ${cur?`<button class="btnd" onclick="setPanelTls('')">关闭 HTTPS，改回仅本机</button>`:''}</div>
-   ${cur?'':`<p style="color:#8b93a1;font-size:12px;margin-top:8px">下方证书点「用于面板」即可用域名 HTTPS 访问</p>`}</div>`;
- document.getElementById('certlist').innerHTML=head+(CERTS.length?CERTS.map(c=>`<div class="card">
-   <h3>${c.domain}${cur===c.domain?'<span class="badge" style="background:#1e3a2a;color:#8ff0b5">面板使用中</span>':''}</h3>
-   <div class="row"><span>到期</span><span>${c.expire}</span></div>
-   ${cur!==c.domain?`<div class="acts"><button class="btn2" onclick="setPanelTls('${c.domain}')">用于面板 HTTPS</button></div>`:''}
+   ${cur?'':`<p class="mut" style="font-size:12px;margin-top:8px">下方证书点「用于面板」即可用域名 HTTPS 访问</p>`}</div>`;
+ $('certlist').innerHTML=head+(CERTS.length?CERTS.map(c=>`<div class="card">
+   <h3>${esc(c.domain)}${cur===c.domain?'<span class="badge g">面板使用中</span>':''}</h3>
+   <div class="row"><span>到期</span><span>${esc(c.expire)}</span></div>
+   ${cur!==c.domain?`<div class="acts"><button class="btn2" onclick="setPanelTls('${esc(c.domain)}')">用于面板 HTTPS</button></div>`:''}
    </div>`).join(''):'<div class="empty">暂无证书，点上方申请</div>')}
-function pathDlg(){document.getElementById('mbox').innerHTML=`<h2>更换面板访问路径</h2>
- <p style="color:#8b93a1;font-size:13px;margin-bottom:8px">路径可防止面板被扫描器发现。更换后旧地址立即 404</p>
+function pathDlg(){openM(`<h2>更换面板访问路径</h2>
+ <p class="mut" style="font-size:13px;margin-bottom:8px">路径可防止面板被扫描器发现。更换后旧地址立即 404</p>
  <label>路径（留空=取消路径，4-64 位字母/数字/-/_）</label>
  <input id="pp-v" placeholder="留空则取消">
  <div class="acts"><button onclick="savePath(0)">保存</button>
  <button class="btn2" onclick="savePath(1)">随机生成</button>
- <button class="btn2" onclick="closeM()">取消</button></div>`;
- document.getElementById('modal').classList.add('show')}
+ <button class="btn2" onclick="closeM()">取消</button></div>`)}
 async function savePath(rand){
- const r=await api('/panel-path','POST',{path:rand?'':document.getElementById('pp-v').value,random:!!rand});
+ const r=await api('/panel-path','POST',{path:rand?'':$('pp-v').value,random:!!rand});
  if(!r.ok)return msg(r.msg);
- document.getElementById('mbox').innerHTML=`<h2>路径已更换</h2>
-  <p style="color:#8b93a1;font-size:13px;margin:8px 0">请用新地址访问（当前页面已失效）：</p>
+ $('mbox').innerHTML=`<h2>路径已更换</h2>
+  <p class="mut" style="font-size:13px;margin:8px 0">请用新地址访问（当前页面已失效）：</p>
   <div class="uri" onclick="cp(this.textContent)">${esc(r.url)}</div>
-  <div class="acts"><button onclick="location.href='${r.url}'">前往新地址</button></div>`}
+  <div class="acts"><button onclick="location.href='${esc(r.url)}'">前往新地址</button></div>`}
 async function setPanelTls(d){
  if(d&&!confirm(`将面板改为 https://${d}:端口 访问？\n\n注意：面板会监听公网，建议用防火墙限制来源 IP。`))return;
  if(!d&&!confirm('关闭 HTTPS？面板将只监听 127.0.0.1，需要 SSH 隧道才能访问。'))return;
  const r=await api('/panel-tls','POST',{domain:d});
- if(r.ok){document.getElementById('mbox').innerHTML=`<h2>面板正在重启</h2>
-   <p style="color:#8b93a1;font-size:13px;margin:10px 0">请用新地址访问（含路径，点击可复制）：</p>
+ if(r.ok){openM(`<h2>面板正在重启</h2>
+   <p class="mut" style="font-size:13px;margin:10px 0">请用新地址访问（含路径，点击可复制）：</p>
    <div class="uri" onclick="cp(this.textContent)">${esc(r.url)}</div>
-   ${r.hint?`<p style="color:#f0c674;font-size:12px">${esc(r.hint.trim())}</p>`:''}
-   <p style="color:#8b93a1;font-size:13px;margin:14px 0 6px">订阅链接同步更新为：</p>
+   ${r.hint?`<p style="color:var(--warn);font-size:12px">${esc(r.hint.trim())}</p>`:''}
+   <p class="mut" style="font-size:13px;margin:14px 0 6px">订阅链接同步更新为：</p>
    <div class="uri" onclick="cp(this.textContent)">${esc(r.suburl||'')}</div>
-   <p style="color:#f0c674;font-size:12px;margin-top:6px">⚠ 客户端里的订阅地址需要改成新的</p>
-   <div class="acts">${d?`<button onclick="location.href='${r.url}'">前往新地址</button>`:''}
-   <button class="btn2" onclick="closeM()">关闭</button></div>`;
-  document.getElementById('modal').classList.add('show')}else msg(r.msg)}
+   <p style="color:var(--warn);font-size:12px;margin-top:6px">⚠ 客户端里的订阅地址需要改成新的</p>
+   <div class="acts">${d?`<button onclick="location.href='${esc(r.url)}'">前往新地址</button>`:''}
+   <button class="btn2" onclick="closeM()">关闭</button></div>`)}else msg(r.msg)}
 async function loadSub(){let r;
- try{r=await api('/sub')}catch(e){
-   document.getElementById('subinfo').innerHTML=`<div class="alert">加载失败: ${esc(e.message||e)}</div>`;return}
- if(!r||!r.url){document.getElementById('subinfo').innerHTML=
-   `<div class="alert">接口异常${r&&r.msg?': '+esc(r.msg):''}<div class="cmd">journalctl -u singbox-panel -n 30 --no-pager</div></div>`;return}
- document.getElementById('suburl').textContent=r.url;
+ try{r=await api('/sub')}catch(e){$('subinfo').innerHTML=`<div class="alert">加载失败: ${esc(e.message||e)}</div>`;return}
+ if(!r||!r.url){$('subinfo').innerHTML=`<div class="alert">接口异常${r&&r.msg?': '+esc(r.msg):''}<div class="cmd">journalctl -u singbox-panel -n 30 --no-pager</div></div>`;return}
+ $('suburl').textContent=r.url;
  let h='';
  if(r.legacy)h+=`<div class="alert">⚠ 订阅服务仍在用旧版(http.server)，会导致订阅为空或被下载。<br>
    在服务器执行下面命令切换到新版：<div class="cmd">sed -i 's|ExecStart=.*|ExecStart=/usr/bin/python3 /etc/sing-box/panel.py --sub|;/WorkingDirectory/d' /etc/systemd/system/singbox-sub.service \&\& systemctl daemon-reload \&\& systemctl restart singbox-sub</div></div>`;
- if(!r.running)h+=`<div class="alert">⚠ 订阅端口未监听，可能被其他程序占用：
-   <div class="cmd">ss -ltnp | grep :端口号  →  确认后 systemctl restart singbox-panel</div></div>`;
+ if(!r.running)h+=`<div class="alert">⚠ 订阅端口未监听，可能被其他程序占用：<div class="cmd">ss -ltnp | grep :端口号  →  确认后 systemctl restart singbox-panel</div></div>`;
  h+=`<div class="row"><span>节点数</span><span><b>${r.count}</b></span></div>`;
- h+=`<div class="row"><span>地址类型</span><span>${r.domain?`<b style="color:#3ddc84">域名 HTTPS</b>`:'IP + HTTP <i style="color:#6b7280;font-style:normal;font-size:12px">（证书页启用 HTTPS 后自动改用域名）</i>'}</span></div>`;
+ h+=`<div class="row"><span>地址类型</span><span>${r.domain?'<b style="color:var(--ok)">域名 HTTPS</b>':'IP + HTTP <i class="mut" style="font-style:normal;font-size:12px">（证书页启用 HTTPS 后自动改用域名）</i>'}</span></div>`;
  if(r.count)h+=`<div class="row"><span>包含</span><span>${r.names.map(esc).join('、')}</span></div>`;
  else h+=`<div class="alert">订阅内没有节点。请先到「节点」页创建节点。</div>`;
- h+=`<div class="acts"><button class="btn2" onclick="window.open(document.getElementById('suburl').textContent+'?plain=1')">查看明文内容</button>
+ h+=`<div class="acts"><button class="btn2" onclick="window.open($('suburl').textContent+'?plain=1')">查看明文内容</button>
    <button class="btn2" onclick="subTokenDlg()">更换订阅地址</button></div>`;
- h+=`<p style="color:#8b93a1;font-size:12px;margin-top:10px">点击链接可复制 · token 即密码，勿外泄</p>`;
- document.getElementById('subinfo').innerHTML=h}
-async function loadVer(){const box=document.getElementById('verbox');
+ h+=`<p class="mut" style="font-size:12px;margin-top:10px">点击链接可复制 · token 即密码，勿外泄</p>`;
+ $('subinfo').innerHTML=h}
+async function loadVer(){const box=$('verbox');
  box.innerHTML='<div class="card"><div class="scanning">检查更新中…</div></div>';
  const r=await api('/versions');
  const cur=r.current||'未知',pin=r.pinned||'';
  let banner='';
  if(r.has_update){banner=`<div class="alert" style="background:#16241c;border-color:#2d7f4f;color:#8ff0b5">
    🎉 有新版本 <b>${esc(r.latest)}</b> 可用（当前 ${esc(cur)}）
-   ${r.note?`<div style="color:#8b93a1;font-size:12px;margin-top:6px;white-space:pre-wrap;max-height:80px;overflow:auto">${esc(r.note)}</div>`:''}
-   <div class="acts"><button onclick="doInstall('${r.latest}')">立即升级</button></div></div>`}
- else if(r.latest){banner=`<div class="alert" style="background:#1a1d23;border-color:#2c313a;color:#8b93a1">✓ 已是最新版本 ${esc(cur)}</div>`}
- const rows=(r.list||[]).map(v=>{
-   const isCur=v.ver===cur;
+   ${r.note?`<div style="color:var(--tx2);font-size:12px;margin-top:6px;white-space:pre-wrap;max-height:80px;overflow:auto">${esc(r.note)}</div>`:''}
+   <div class="acts"><button onclick="doInstall('${esc(r.latest)}')">立即升级</button></div></div>`}
+ else if(r.latest){banner=`<div class="alert" style="background:var(--bg2);border-color:var(--line2);color:var(--tx2)">✓ 已是最新版本 ${esc(cur)}</div>`}
+ const rows=(r.list||[]).map(v=>{const isCur=v.ver===cur;
    const tag=v.pre?'<span class="vtag pre">预发布</span>':'<span class="vtag rel">正式版</span>';
-   return `<div class="scanrow${isCur?' vcur':''}">
-     <span>${v.ver} ${tag} <i style="color:#6b7280;font-style:normal;font-size:12px">${v.date}</i></span>
-     ${isCur?'<b style="color:#3ddc84">使用中</b>'
-            :`<button class="btn2" style="padding:4px 12px;font-size:12px" onclick="doInstall('${v.ver}')">切换</button>`}
-   </div>`}).join('');
+   return `<div class="scanrow${isCur?' vcur':''}"><span>${esc(v.ver)} ${tag} <i class="mut" style="font-style:normal;font-size:12px">${esc(v.date)}</i></span>
+     ${isCur?'<b style="color:var(--ok)">使用中</b>':`<button class="btn2 sm" onclick="doInstall('${esc(v.ver)}')">切换</button>`}</div>`}).join('');
  const dk=await api('/disk').catch(()=>null);
  let disk='';
- if(dk){const root=dk['/']||{},t=dk['/tmp']||{};
-  const low=(root.avail||999)<150;
-  disk=`<div class="card"><h3>磁盘 ${low?'<span class="badge" style="background:#3a1f22;color:#ff8080">空间不足</span>':''}</h3>
+ if(dk){const root=dk['/']||{},t=dk['/tmp']||{};const low=(root.avail||999)<150;
+  disk=`<div class="card"><h3>磁盘 ${low?'<span class="badge r">空间不足</span>':''}</h3>
    <div class="row"><span>根分区 /</span><span>可用 <b>${root.avail||'?'}MB</b> / ${root.total||'?'}MB</span></div>
-   <div class="row"><span>/tmp</span><span>可用 ${t.avail||'?'}MB / ${t.total||'?'}MB ${dk.tmp_is_ram?'<i style="color:#f0c674;font-style:normal;font-size:12px">内存盘</i>':''}</span></div>
-   <div class="acts"><button class="btn2" onclick="doClean(0)">清理残留</button>
-   <button class="btn2" onclick="doClean(1)">深度清理 (含apt/日志)</button></div>
-   <p style="color:#8b93a1;font-size:12px;margin-top:8px">升级需要约 100MB。后台每 12 小时自动清理一次残留</p></div>`}
- box.innerHTML=banner+disk+`<div class="card"><h3>当前版本</h3>
+   <div class="row"><span>/tmp</span><span>可用 ${t.avail||'?'}MB / ${t.total||'?'}MB ${dk.tmp_is_ram?'<i style="color:var(--warn);font-style:normal;font-size:12px">内存盘</i>':''}</span></div>
+   <div class="acts"><button class="btn2" onclick="doClean(0)">清理残留</button><button class="btn2" onclick="doClean(1)">深度清理 (含apt/日志)</button></div>
+   <p class="mut" style="font-size:12px;margin-top:8px">升级需要约 100MB。后台每 12 小时自动清理一次残留</p></div>`}
+ box.innerHTML=banner+`<div class="grid2"><div class="card"><h3>当前版本</h3>
    <div class="row"><span>版本</span><span><b>${esc(cur)}</b></span></div>
-   <div class="row"><span>锁定</span><span>${pin?`<b style="color:#f0c674">${esc(pin)}</b>`:'未锁定'}</span></div>
-   <div class="acts">
-     <button class="btn2" onclick="loadVer()">🔄 检查更新</button>
+   <div class="row"><span>锁定</span><span>${pin?`<b style="color:var(--warn)">${esc(pin)}</b>`:'未锁定'}</span></div>
+   <div class="acts"><button class="btn2" onclick="loadVer()">🔄 检查更新</button>
      <button class="btn2" onclick="doPin(${pin?'false':'true'})">${pin?'解除锁定':'锁定当前版本'}</button>
-     <button class="btn2" onclick="manualVer()">安装其他版本</button>
-   </div>
-   <p style="color:#8b93a1;font-size:12px;margin-top:8px">锁定后切换版本会二次确认，防止误升级</p></div>
-  <div class="card"><h3>自动更新 ${r.auto&&r.auto.enabled?'<span class="badge" style="background:#1e3a2a;color:#8ff0b5">已开启</span>':'<span class="badge">已关闭</span>'}</h3>
-   <label class="chk" style="margin:6px 0"><input type="checkbox" id="au-on" ${r.auto&&r.auto.enabled?'checked':''}>
-     <span>发现新版本时自动升级 <i>失败会自动回滚</i></span></label>
-   <label>更新通道</label>
-   <select id="au-ch">
-     <option value="stable" ${(!r.auto||r.auto.channel==='stable')?'selected':''}>仅正式版（推荐，稳定）</option>
-     <option value="all" ${r.auto&&r.auto.channel==='all'?'selected':''}>含预发布 beta/alpha（尝鲜，有风险）</option>
-   </select>
-   <label>检查间隔（小时）</label>
-   <input id="au-iv" type="number" min="1" value="${(r.auto&&r.auto.interval_hours)||12}">
+     <button class="btn2" onclick="manualVer()">安装其他版本</button></div>
+   <p class="mut" style="font-size:12px;margin-top:8px">锁定后切换版本会二次确认，防止误升级</p></div>
+  <div class="card"><h3>自动更新 ${r.auto&&r.auto.enabled?'<span class="badge g">已开启</span>':'<span class="badge">已关闭</span>'}</h3>
+   <label class="chk" style="margin:6px 0"><input type="checkbox" id="au-on" ${r.auto&&r.auto.enabled?'checked':''}><span>发现新版本时自动升级 <i>失败会自动回滚</i></span></label>
+   <div class="f2"><div><label>更新通道</label><select id="au-ch">
+     <option value="stable" ${(!r.auto||r.auto.channel==='stable')?'selected':''}>仅正式版（推荐）</option>
+     <option value="all" ${r.auto&&r.auto.channel==='all'?'selected':''}>含预发布 beta/alpha</option></select></div>
+    <div><label>检查间隔（小时）</label><input id="au-iv" type="number" min="1" value="${(r.auto&&r.auto.interval_hours)||12}"></div></div>
    <div class="acts"><button onclick="saveAuto()">保存</button></div>
-   ${pin?`<p style="color:#f0c674;font-size:12px;margin-top:8px">⚠ 当前已锁定版本，自动更新不会执行</p>`:''}
-   ${(r.auto_log&&r.auto_log.length)?`<p style="color:#8b93a1;font-size:12px;margin-top:10px">最近记录：</p>
-     <div style="font-size:12px;color:#6b7280;line-height:1.8">${r.auto_log.slice().reverse().map(x=>`${x.t} · ${esc(x.msg)}`).join('<br>')}</div>`:''}
-  </div>
+   ${pin?`<p style="color:var(--warn);font-size:12px;margin-top:8px">⚠ 当前已锁定版本，自动更新不会执行</p>`:''}
+   ${(r.auto_log&&r.auto_log.length)?`<p class="mut" style="font-size:12px;margin-top:10px">最近记录：</p><div class="mut" style="font-size:12px;line-height:1.8">${r.auto_log.slice().reverse().map(x=>`${esc(x.t)} · ${esc(x.msg)}`).join('<br>')}</div>`:''}
+  </div></div>${disk}
   <div class="card"><h3>最近版本 <span class="badge">最新 ${(r.list||[]).length} 个</span></h3>
    <div class="scanlist">${rows||'<div class="empty">获取失败，检查服务器能否访问 GitHub</div>'}</div>
-   <p style="color:#8b93a1;font-size:12px;margin-top:8px">需要更早的版本请用「安装其他版本」手动输入</p></div>`}
+   <p class="mut" style="font-size:12px;margin-top:8px">需要更早的版本请用「安装其他版本」手动输入</p></div>`}
 async function doInstall(v){const r0=await api('/versions');
  if(r0.pinned&&r0.pinned!==v&&!confirm(`当前锁定在 ${r0.pinned}，确定切换到 ${v}？`))return;
- if(!confirm(`切换到 sing-box ${v}？\n\n会自动备份当前版本，若新版本无法加载配置将自动回滚。`))return;
+ if(!confirm(`切换到 sing-box ${v}？\n\n若新版本无法加载配置将自动回滚。`))return;
  const r=await api('/install-version','POST',{version:v});
  if(!r.ok){alert(r.msg);return}
- document.getElementById('mbox').innerHTML=`<h2>切换到 ${esc(v)}</h2>
-  <div id="vstat" class="alert" style="background:#1a1d23;border-color:#2c313a;color:#8b93a1">
-    <span class="spin"></span> 准备中…</div>
-  <div class="acts"><button class="btn2" onclick="closeM()">后台运行，关闭窗口</button></div>`;
- document.getElementById('modal').classList.add('show');
+ openM(`<h2>切换到 ${esc(v)}</h2><div id="vstat" class="alert" style="background:var(--bg2);border-color:var(--line2);color:var(--tx2)"><span class="spin"></span> 准备中…</div>
+  <div class="acts"><button class="btn2" onclick="closeM()">后台运行，关闭窗口</button></div>`);
  pollVer()}
-async function pollVer(){
- for(let i=0;i<120;i++){
-   await new Promise(r=>setTimeout(r,2000));
+async function pollVer(){for(let i=0;i<120;i++){await new Promise(r=>setTimeout(r,2000));
    let s;try{s=await api('/version-status')}catch(e){return}
-   const box=document.getElementById('vstat');if(!box)return;
+   const box=$('vstat');if(!box)return;
    if(s.running){box.innerHTML=`<span class="spin"></span> ${esc(s.step||'处理中')}… (${(i+1)*2}s)`;continue}
-   if(s.ok===true){box.style.cssText='background:#16241c;border-color:#2d7f4f;color:#8ff0b5';
-     box.textContent='✓ '+s.msg;loadVer();refresh();setTimeout(closeM,1500);return}
-   if(s.ok===false){box.style.cssText='';
-     box.innerHTML='✗ '+esc(s.msg).replace(/\n/g,'<br>');return}
- }
- const box=document.getElementById('vstat');if(box)box.textContent='超时，请查看日志';}
-function manualVer(){document.getElementById('mbox').innerHTML=`<h2>手动指定版本</h2>
- <label>版本号（不带 v 前缀）</label><input id="mv" placeholder="1.14.0-beta.7">
- <div class="acts"><button onclick="(async()=>{const v=document.getElementById('mv').value.trim();if(!v)return;closeM();doInstall(v)})()">安装</button>
- <button class="btn2" onclick="closeM()">取消</button></div>`;
- document.getElementById('modal').classList.add('show')}
-async function saveAuto(){
- const en=document.getElementById('au-on').checked;
- const ch=document.getElementById('au-ch').value;
- const iv=parseInt(document.getElementById('au-iv').value)||12;
+   if(s.ok===true){box.style.cssText='background:#16241c;border-color:#2d7f4f;color:#8ff0b5';box.textContent='✓ '+s.msg;loadVer();refresh();setTimeout(closeM,1500);return}
+   if(s.ok===false){box.style.cssText='';box.innerHTML='✗ '+esc(s.msg).replace(/\n/g,'<br>');return}}
+ const box=$('vstat');if(box)box.textContent='超时，请查看日志'}
+function manualVer(){openM(`<h2>手动指定版本</h2><label>版本号（不带 v 前缀）</label><input id="mv" placeholder="1.14.0-beta.7">
+ <div class="acts"><button onclick="(async()=>{const v=$('mv').value.trim();if(!v)return;closeM();doInstall(v)})()">安装</button><button class="btn2" onclick="closeM()">取消</button></div>`)}
+async function saveAuto(){const en=$('au-on').checked,ch=$('au-ch').value,iv=parseInt($('au-iv').value)||12;
  if(en&&ch==='all'&&!confirm('含预发布通道会自动升到 beta/alpha 版本。\n\n预发布版可能引入不兼容变更，确定开启？'))return;
- const r=await api('/auto-update','POST',{enabled:en,channel:ch,interval_hours:iv});
- msg(r.msg,1);loadVer()}
-async function doClean(deep){
- if(deep&&!confirm('深度清理会清空 apt 缓存并压缩系统日志，确定？'))return;
- msg('清理中…',1);
- const r=await api('/cleanup','POST',{deep:!!deep});
- msg(r.msg,1);loadVer()}
+ const r=await api('/auto-update','POST',{enabled:en,channel:ch,interval_hours:iv});msg(r.msg,1);loadVer()}
+async function doClean(deep){if(deep&&!confirm('深度清理会清空 apt 缓存并压缩系统日志，确定？'))return;
+ msg('清理中…',1);const r=await api('/cleanup','POST',{deep:!!deep});msg(r.msg,1);loadVer()}
 async function doPin(p){const r=await api('/pin-version','POST',{pin:p});msg(r.msg,1);loadVer()}
-function subTokenDlg(){document.getElementById('mbox').innerHTML=`<h2>更换订阅地址</h2>
- <p style="color:#f0c674;font-size:13px;margin-bottom:8px">⚠ 更换后旧地址立即失效，所有客户端都要改成新地址</p>
- <label>自定义 token（留空则随机生成）</label>
- <input id="st-tok" placeholder="8-64 位字母/数字/-/_">
- <div class="acts"><button onclick="saveSubToken()">更换</button>
- <button class="btn2" onclick="closeM()">取消</button></div>`;
- document.getElementById('modal').classList.add('show')}
-async function saveSubToken(){
- const r=await api('/sub-token','POST',{token:document.getElementById('st-tok').value});
+function subTokenDlg(){openM(`<h2>更换订阅地址</h2>
+ <p style="color:var(--warn);font-size:13px;margin-bottom:8px">⚠ 更换后旧地址立即失效，所有客户端都要改成新地址</p>
+ <label>自定义 token（留空则随机生成）</label><input id="st-tok" placeholder="8-64 位字母/数字/-/_">
+ <div class="acts"><button onclick="saveSubToken()">更换</button><button class="btn2" onclick="closeM()">取消</button></div>`)}
+async function saveSubToken(){const r=await api('/sub-token','POST',{token:$('st-tok').value});
  if(!r.ok)return msg(r.msg);
- document.getElementById('mbox').innerHTML=`<h2>订阅地址已更换</h2>
-  <div class="uri" onclick="cp(this.textContent)">${esc(r.url)}</div>
-  <p style="color:#f0c674;font-size:12px;margin-top:8px">旧地址已失效，请更新所有客户端</p>
+ $('mbox').innerHTML=`<h2>订阅地址已更换</h2><div class="uri" onclick="cp(this.textContent)">${esc(r.url)}</div>
+  <p style="color:var(--warn);font-size:12px;margin-top:8px">旧地址已失效，请更新所有客户端</p>
   <div class="acts"><button onclick="closeM();loadSub()">完成</button></div>`}
-function fmtDur(s){if(s==null)return '—';const d=Math.floor(s/86400),h=Math.floor(s%86400/3600),m=Math.floor(s%3600/60);
- return d?`${d}天${h}小时`:(h?`${h}小时${m}分`:`${m}分`)}
 async function loadHealth(){let h;try{h=await api('/health')}catch(e){return}
- const b=document.getElementById('hbadge');
- const txt={green:'运行正常',yellow:'需要注意',red:'存在故障'}[h.level]||'未知';
- b.className='hbadge '+h.level; b.textContent=txt+(h.problems.length?` · ${h.problems.length}`:'');
+ const b=$('hbadge');const txt={green:'运行正常',yellow:'需要注意',red:'存在故障'}[h.level]||'未知';
+ b.className='hbadge '+h.level;b.textContent=txt+(h.problems.length?` · ${h.problems.length}`:'');
  b.title=h.problems.join(' / ')||'所有子系统正常';
- const d=document.getElementById('hdetail');
- if(d){d.textContent=txt;d.style.cssText=h.level==='green'
-   ?'background:rgba(52,211,153,.14);color:var(--ok)':(h.level==='yellow'
-   ?'background:rgba(251,191,36,.14);color:var(--warn)':'background:rgba(248,113,113,.14);color:var(--err)')}
- const box=document.getElementById('hbox'); if(!box)return;
+ const d=$('hdetail');
+ if(d){d.textContent=txt;d.className='badge '+({green:'g',yellow:'y',red:'r'}[h.level]||'')}
+ const box=$('hbox');if(!box)return;
  const th=Object.entries(h.threads||{}).map(([n,t])=>
    `<div class="hitem"><b>线程 ${esc(n)}</b><span>${t.alive?'<span style="color:var(--ok)">运行中</span>':'<span style="color:var(--err)">已停止</span>'}`
    +(t.restarts?` · 重启 ${t.restarts} 次`:'')+`</span>`
-   +(t.last_error?`<div style="color:var(--tx3);font-size:11px;margin-top:3px">${esc(t.last_error)}</div>`:'')+`</div>`).join('');
+   +(t.last_error?`<div class="mut" style="font-size:11px;margin-top:3px">${esc(t.last_error)}</div>`:'')+`</div>`).join('');
  const cert=h.cert.days_left==null?'未启用':`${h.cert.days_left} 天`;
  const certColor=h.cert.days_left!=null&&h.cert.days_left<15?'var(--warn)':'var(--tx)';
  box.innerHTML=(h.problems.length?`<div class="alert">${h.problems.map(esc).join('<br>')}</div>`:'')
   +`<div class="hgrid">
-   <div class="hitem"><b>订阅服务</b><span>${h.subscription.listening
-     ?'<span style="color:var(--ok)">监听中</span>':'<span style="color:var(--err)">未监听</span>'} · ${h.subscription.scheme}:${h.subscription.port}</span></div>
+   <div class="hitem"><b>订阅服务</b><span>${h.subscription.listening?'<span style="color:var(--ok)">监听中</span>':'<span style="color:var(--err)">未监听</span>'} · ${esc(h.subscription.scheme)}:${h.subscription.port}</span></div>
    <div class="hitem"><b>sing-box</b><span>${esc(h.singbox.state)} · ${h.singbox.inbounds} 个节点</span></div>
    <div class="hitem"><b>证书剩余</b><span style="color:${certColor}">${cert}</span></div>
    <div class="hitem"><b>面板内存</b><span>${h.rss_mb==null?'—':h.rss_mb+' MB'}</span></div>
    <div class="hitem"><b>已运行</b><span>${fmtDur(h.uptime_sec)}</span></div>
   </div><div class="hgrid">${th}</div>`;
- const rl=document.getElementById('runlog');
- if(rl)rl.textContent=(h.runlog||[]).map(x=>`[${x.level}] ${x.t}  ${x.msg}`).join('\n')||'（暂无事件）';}
-async function loadLog(){const r=await api('/logs');
- const st=r.state||await api('/log-state');
- renderLogCtl(st);
- document.getElementById('logbox').textContent=
-   st.enabled?(r.log||'（暂无日志）'):'日志已关闭。开启后 sing-box 才会写入 journald。';}
-
+ const rl=$('runlog');if(rl)rl.textContent=(h.runlog||[]).map(x=>`[${x.level}] ${x.t}  ${x.msg}`).join('\n')||'（暂无事件）'}
+async function loadLog(){const r=await api('/logs');const st=r.state||await api('/log-state');renderLogCtl(st);
+ $('logbox').textContent=st.enabled?(r.log||'（暂无日志）'):'日志已关闭。开启后 sing-box 才会写入 journald。'}
 function renderLogCtl(st){
- document.getElementById('log-badge').outerHTML=st.enabled
-  ?`<span id="log-badge" class="badge" style="background:#1e3a2a;color:#8ff0b5">已开启 · ${esc(st.level)}</span>`
-  :'<span id="log-badge" class="badge">已关闭</span>';
- document.getElementById('log-ctl').innerHTML=st.enabled?`
+ $('log-badge').outerHTML=st.enabled?`<span id="log-badge" class="badge g">已开启 · ${esc(st.level)}</span>`:'<span id="log-badge" class="badge">已关闭</span>';
+ $('log-ctl').innerHTML=st.enabled?`
   <label>日志级别 <span class="hint">越靠后越安静。warn / error 适合长期开着</span></label>
   <select id="log-lv">${(st.levels||[]).map(v=>`<option ${v===st.level?'selected':''}>${v}</option>`).join('')}</select>
-  <div class="acts"><button class="btn2" onclick="setLog(1)">应用级别</button>
-   <button class="btnd" onclick="setLog(0)">关闭日志</button></div>
-  <p style="color:#8b93a1;font-size:12px;margin-top:6px">改动会重启 sing-box，已连接的会话会断一下</p>`
+  <div class="acts"><button class="btn2" onclick="setLog(1)">应用级别</button><button class="btnd" onclick="setLog(0)">关闭日志</button></div>
+  <p class="mut" style="font-size:12px;margin-top:6px">改动会重启 sing-box，已连接的会话会断一下</p>`
   :`<div class="alert">日志已关闭，sing-box 不再写 journald —— 省磁盘和 IO，但出问题时也查不到原因。</div>
    <div class="acts"><button onclick="setLog(1)">开启日志</button></div>`}
-
-async function setLog(on){
- const lv=document.getElementById('log-lv');
+async function setLog(on){const lv=$('log-lv');
  if(!on&&!confirm('关闭日志后 sing-box 不再记录任何信息，排查故障会很困难。\n\n会重启 sing-box，确定关闭？'))return;
- const r=await api('/set-log','POST',{enabled:!!on,level:lv?lv.value:undefined});
- msg(r.msg,r.ok?1:0);
- if(r.ok){setTimeout(()=>{loadLog();refresh()},1200)}}
-function esc(s){return String(s).replace(/[<>&"]/g,c=>({'<':'&lt;','>':'&gt;','&':'&amp;','"':'&quot;'}[c]))}
-async function editNode(t0){const t=decodeURIComponent(t0);
- const d=await api('/inbound-detail/'+encodeURIComponent(t));
- if(!d.ok)return msg(d.msg||'读取失败');
- const spec=PROTOS[d.proto];
- if(!spec)return msg('未知协议');
- document.getElementById('mbox').innerHTML=`<h2>编辑节点 · ${esc(d.name)}</h2>
-  <p style="color:#8b93a1;font-size:12px;margin-bottom:6px">协议：${esc(spec.label)}（不可更改）· 出站绑定保持不变</p>
-  <div id="fields"></div>
-  <div class="acts"><button onclick="saveEdit('${encodeURIComponent(t)}','${d.proto}')">保存</button>
-  <button class="btn2" onclick="closeM()">取消</button></div>`;
- document.getElementById('modal').classList.add('show');
- if(spec.needs_cert&&!CERTS.length){const cr=await api('/certs');CERTS=cr.certs||[]}
- const gv=f=>d.fields[f.k]!==undefined?String(d.fields[f.k]):(f.d||'');
- document.getElementById('fields').innerHTML=
-   spec.fields.map(f=>fld(f,gv(f))).join('')+advHTML(spec,gv)}
-async function saveEdit(t0,proto){const t=decodeURIComponent(t0);
- const fs=collectF(PROTOS[proto]);
- const r=await api('/inbound-edit/'+encodeURIComponent(t),'POST',{proto:proto,fields:fs});
- if(r.ok){closeM();msg('已保存，客户端需重新拉订阅',1);loadIn();refresh()}else alert(r.msg)}
-function newNode(){const opts=Object.entries(PROTOS).map(([k,v])=>`<option value="${k}">${v.label}</option>`).join('');
- document.getElementById('mbox').innerHTML=`<h2>添加节点</h2><label>协议</label><select id="proto" onchange="renderF()">${opts}</select><div id="fields"></div>
- <div class="acts"><button onclick="saveNode()">创建</button><button class="btn2" onclick="closeM()">取消</button></div>`;
- document.getElementById('modal').classList.add('show');renderF()}
-async function renderF(){const p=document.getElementById('proto').value,spec=PROTOS[p];
- if(spec.needs_cert&&!CERTS.length){const cr=await api('/certs');CERTS=cr.certs||[]}
- const a=await api('/autofill');
- const gv=f=>f.auto?(a[f.auto]||''):(f.d||'');
- document.getElementById('fields').innerHTML=
-   spec.fields.map(f=>fld(f,gv(f))).join('')+advHTML(spec,gv)}
-
-// 单个字段 -> HTML
-function fld(f,v){v=v===undefined?'':String(v);
- const h=f.h?`<span class="hint">${esc(f.h)}</span>`:'';
- if(f.t==='bool')return `<label class="chk"><input type="checkbox" id="f-${f.k}" ${v==='1'?'checked':''}><span>${esc(f.l)}</span>${f.h?`<i>${esc(f.h)}</i>`:''}</label>`;
- if(f.t==='cert'){const o=CERTS.map(c=>`<option value="${c.domain}" ${c.domain===v?'selected':''}>${c.domain}</option>`).join('');
-  return `<label>${esc(f.l)}${h}</label>`+(CERTS.length?`<select id="f-${f.k}">${o}</select>`:`<div class="alert">无可用证书，请先到「证书」页申请</div>`)}
- if(f.t==='select')return `<label>${esc(f.l)}${h}</label><select id="f-${f.k}">${f.opts.map(o=>`<option ${o===v?'selected':''}>${esc(o)}</option>`).join('')}</select>`;
- if(f.t==='dest')return `<label>${esc(f.l)} <a href="javascript:;" onclick="scanDest()">⚡ 扫描可用目标</a></label>
-  <input id="f-${f.k}" type="text" value="${esc(v)}"><div id="scanres"></div>`;
- return `<label>${esc(f.l)}${h}</label><input id="f-${f.k}" type="${f.t}" value="${esc(v)}">`}
-
-const TRKEYS=['transport','tr_path','tr_host','tr_ed'];
-// 高级选项折叠区
-function advHTML(spec,gv){const a=spec.adv||[];if(!a.length)return '';
- const perf=a.filter(f=>TRKEYS.indexOf(f.k)<0),tr=a.filter(f=>TRKEYS.indexOf(f.k)>=0);
- let out='';
- if(perf.length)out+=`<details><summary>高级选项 · 性能与抗封锁（${perf.length}）</summary>
-  <div class="dbody">${perf.map(f=>fld(f,gv(f))).join('')}</div></details>`;
- if(tr.length)out+=`<details><summary>传输层设置（可过 CDN）</summary>
-  <div class="dbody">${tr.map(f=>fld(f,gv(f))).join('')}</div></details>`;
- return out}
-
-// 收集表单（含高级选项）
-function collectF(spec){const fs={};
- (spec.fields||[]).concat(spec.adv||[]).forEach(f=>{const e=document.getElementById('f-'+f.k);
-  if(e)fs[f.k]=(f.t==='bool')?(e.checked?'1':'0'):e.value});
- return fs}
-async function scanDest(){const box=document.getElementById('scanres');
- box.innerHTML='<div class="scanning">扫描中，约 8 秒…</div>';
- const r=await api('/scan');
- box.innerHTML=`<div class="scanlist">`+r.map(x=>{
-   const cls=x.ok?'sok':'sbad';
-   const info=x.ok
-     ?`${x.ms}ms · TLS1.3 · H2${x.issuer?' · '+esc(x.issuer):''}`
-     :(x.err||'不可用');
-   return `<div class="scanrow ${cls}" ${x.ok?`onclick="pickDest('${x.host}')"`:''}>
-     <span>${x.host}</span><b>${info}</b></div>`}).join('')+`</div>
-   <div style="color:#6b7280;font-size:12px;margin-top:6px">点击绿色条目即可选用（需 TLS1.3 + H2 才合格）</div>`}
-function pickDest(h){document.getElementById('f-dest').value=h;
- document.getElementById('scanres').innerHTML='';msg('已选用 '+h,1)}
-async function saveNode(){const p=document.getElementById('proto').value;
- const fs=collectF(PROTOS[p]);
- const r=await api('/inbounds','POST',{proto:p,fields:fs});
- if(r.ok){closeM();msg('节点已创建',1);loadIn();refresh()}else msg(r.msg)}
-async function delIn(t0){const t=decodeURIComponent(t0);if(!confirm('删除节点 '+t+'?'))return;const r=await api('/inbounds/'+encodeURIComponent(t),'DELETE');
- if(r.ok){msg('已删除',1);loadIn();refresh()}else msg(r.msg)}
-function obForm(d){  // d=已有数据(编辑) 或 null(新增)
- d=d||{};
- const k=d.kind||'socks';
- return `<label>类型</label>
- <select id="o-kind" onchange="onKindChange()">
+ const r=await api('/set-log','POST',{enabled:!!on,level:lv?lv.value:undefined});msg(r.msg,r.ok?1:0);
+ if(r.ok)setTimeout(()=>{loadLog();refresh()},1200)}
+function obForm(d){d=d||{};const k=d.kind||'socks';
+ return `<label>类型</label><select id="o-kind" onchange="onKindChange()">
    <option value="socks" ${k==='socks'?'selected':''}>SOCKS（支持 UDP，推荐）</option>
-   <option value="http" ${k==='http'?'selected':''}>HTTP / HTTPS（仅 TCP）</option>
- </select>
- <div class="f2">
-  <div><label>标签</label><input id="o-tag" value="${esc(d.tag||'')}" placeholder="留空自动生成"></div>
-  <div><label>服务器地址</label><input id="o-srv" value="${esc(d.server||'')}" placeholder="1.2.3.4"></div>
- </div>
- <div class="f2">
-  <div><label>服务器端口</label><input id="o-port" type="number" value="${esc(d.port||'')}" placeholder="1080"></div>
-  <div id="o-verbox"><label>版本</label>
-   <select id="o-ver">
-    <option value="5" ${String(d.version||'5')==='5'?'selected':''}>5</option>
-    <option value="4a" ${d.version==='4a'?'selected':''}>4a</option>
-    <option value="4" ${d.version==='4'?'selected':''}>4</option>
-   </select></div>
- </div>
- <div class="f2">
-  <div><label>用户名</label><input id="o-user" value="${esc(d.username||'')}" placeholder="留空=无认证"></div>
-  <div><label>密码</label><input id="o-pass" value="${esc(d.password||'')}"></div>
- </div>
- <div id="o-netbox"><label>网络</label>
-  <select id="o-net">
-   <option value="" ${!d.network?'selected':''}>TCP/UDP（默认）</option>
-   <option value="tcp" ${d.network==='tcp'?'selected':''}>仅 TCP</option>
-   <option value="udp" ${d.network==='udp'?'selected':''}>仅 UDP</option>
-  </select></div>
- <label class="chk" id="o-tlsrow" style="display:${k==='http'?'flex':'none'};margin:8px 0">
-   <input type="checkbox" id="o-tls" ${d.tls?'checked':''}>
-   <span>使用 HTTPS 连接落地 <i>落地需支持 TLS</i></span></label>
- <label class="chk" id="o-uotrow" style="display:${k==='http'?'none':'flex'};margin:4px 0">
-   <input type="checkbox" id="o-uot" ${d.uot?'checked':''}>
-   <span>UDP over TCP <i>仅当落地支持 UoT 时勾选</i></span></label>`}
-
-function onKindChange(){const k=document.getElementById('o-kind').value,g=id=>document.getElementById(id);
- const http=k==='http';
- if(g('o-tlsrow'))g('o-tlsrow').style.display=http?'flex':'none';
- if(g('o-uotrow'))g('o-uotrow').style.display=http?'none':'flex';
- if(g('o-verbox'))g('o-verbox').style.display=http?'none':'block';
- if(g('o-netbox'))g('o-netbox').style.display=http?'none':'block';
- if(g('o-quicrow'))g('o-quicrow').style.display=http?'none':'flex'}
-
-function obPayload(){const g=id=>document.getElementById(id);
- const k=g('o-kind').value;
- return {kind:k, tag:g('o-tag').value.trim(), server:g('o-srv').value.trim(),
-   port:g('o-port').value.trim(), username:g('o-user').value.trim(),
-   password:g('o-pass').value, version:g('o-ver')?g('o-ver').value:'5',
-   network:(k==='socks'&&g('o-net'))?g('o-net').value:'',
-   tls:k==='http'&&g('o-tls')?g('o-tls').checked:false,
-   uot:g('o-uot')?g('o-uot').checked:false}}
-
+   <option value="http" ${k==='http'?'selected':''}>HTTP / HTTPS（仅 TCP）</option></select>
+ <div class="f2"><div><label>标签</label><input id="o-tag" value="${esc(d.tag||'')}" placeholder="留空自动生成"></div>
+  <div><label>服务器地址</label><input id="o-srv" value="${esc(d.server||'')}" placeholder="1.2.3.4"></div></div>
+ <div class="f2"><div><label>服务器端口</label><input id="o-port" type="number" value="${esc(d.port||'')}" placeholder="1080"></div>
+  <div id="o-verbox"><label>版本</label><select id="o-ver">
+    <option value="5" ${String(d.version||'5')==='5'?'selected':''}>5</option><option value="4a" ${d.version==='4a'?'selected':''}>4a</option><option value="4" ${d.version==='4'?'selected':''}>4</option></select></div></div>
+ <div class="f2"><div><label>用户名</label><input id="o-user" value="${esc(d.username||'')}" placeholder="留空=无认证"></div>
+  <div><label>密码</label><input id="o-pass" value="${esc(d.password||'')}"></div></div>
+ <div id="o-netbox"><label>网络</label><select id="o-net">
+   <option value="" ${!d.network?'selected':''}>TCP/UDP（默认）</option><option value="tcp" ${d.network==='tcp'?'selected':''}>仅 TCP</option><option value="udp" ${d.network==='udp'?'selected':''}>仅 UDP</option></select></div>
+ <label class="chk" id="o-tlsrow" style="display:${k==='http'?'flex':'none'};margin:8px 0"><input type="checkbox" id="o-tls" ${d.tls?'checked':''}><span>使用 HTTPS 连接落地 <i>落地需支持 TLS</i></span></label>
+ <label class="chk" id="o-uotrow" style="display:${k==='http'?'none':'flex'};margin:4px 0"><input type="checkbox" id="o-uot" ${d.uot?'checked':''}><span>UDP over TCP <i>仅当落地支持 UoT 时勾选</i></span></label>`}
+function onKindChange(){const k=$('o-kind').value,http=k==='http';
+ ['o-tlsrow','o-uotrow','o-verbox','o-netbox','o-quicrow'].forEach(id=>{const e=$(id);if(!e)return;
+  const showIt={'o-tlsrow':http,'o-uotrow':!http,'o-verbox':!http,'o-netbox':!http,'o-quicrow':!http}[id];
+  e.style.display=showIt?(id.endsWith('row')?'flex':'block'):'none'})}
+function obPayload(){const k=$('o-kind').value;
+ return {kind:k,tag:$('o-tag').value.trim(),server:$('o-srv').value.trim(),port:$('o-port').value.trim(),
+   username:$('o-user').value.trim(),password:$('o-pass').value,version:$('o-ver')?$('o-ver').value:'5',
+   network:(k==='socks'&&$('o-net'))?$('o-net').value:'',tls:k==='http'&&$('o-tls')?$('o-tls').checked:false,uot:$('o-uot')?$('o-uot').checked:false}}
 async function newOut(){const nodes=await api('/inbounds');
- const list=nodes.length?nodes.map(n=>`<label class="chk"><input type="checkbox" class="nd" value="${n.tag}">
-   <span>${esc(n.name)} <i>${n.type} · ${n.port}</i>${n.bind!=='direct'?`<em>当前: ${esc(n.bind)}</em>`:''}</span></label>`).join('')
-   :'<div style="color:#5a626e;font-size:13px;padding:6px 0">还没有节点</div>';
- document.getElementById('mbox').innerHTML=`<h2>添加出站</h2>${obForm(null)}
+ const list=nodes.length?nodes.map(n=>`<label class="chk"><input type="checkbox" class="nd" value="${esc(n.tag)}"><span>${esc(n.name)} <i>${esc(n.type)} · ${n.port}</i>${n.bind!=='direct'?`<em>当前: ${esc(n.bind)}</em>`:''}</span></label>`).join('')
+   :'<div class="mut" style="font-size:13px;padding:6px 0">还没有节点</div>';
+ openM(`<h2>添加出站</h2>${obForm(null)}
  <label style="margin-top:14px">绑定节点 (可多选，选中的节点全部流量走此出站)
    ${nodes.length?'<a href="javascript:;" onclick="allNd(1)">全选</a> / <a href="javascript:;" onclick="allNd(0)">清空</a>':''}</label>
  <div class="chkbox">${list}</div>
- <label class="chk" id="o-quicrow" style="margin:8px 0"><input type="checkbox" id="o-blockquic" checked>
-   <span>拒绝 QUIC，强制走 TCP <i>推荐 · 多数落地不支持 UDP</i></span></label>
- <div class="acts"><button onclick="saveOut()">添加</button><button class="btn2" onclick="closeM()">取消</button></div>`;
- document.getElementById('modal').classList.add('show');onKindChange()}
-
+ <label class="chk" id="o-quicrow" style="margin:8px 0"><input type="checkbox" id="o-blockquic" checked><span>拒绝 QUIC，强制走 TCP <i>推荐 · 多数落地不支持 UDP</i></span></label>
+ <div class="acts"><button onclick="saveOut()">添加</button><button class="btn2" onclick="closeM()">取消</button></div>`);onKindChange()}
 function allNd(v){document.querySelectorAll('.nd').forEach(e=>e.checked=!!v)}
-
 async function saveOut(){const binds=[...document.querySelectorAll('.nd:checked')].map(e=>e.value);
- const g=id=>document.getElementById(id);
- const p=obPayload();p.binds=binds;p.block_quic=g('o-blockquic')?g('o-blockquic').checked:true;
+ const p=obPayload();p.binds=binds;p.block_quic=$('o-blockquic')?$('o-blockquic').checked:true;
  const r=await api('/outbounds','POST',p);
- if(r.ok){closeM();msg('出站已添加'+(binds.length?`，已绑定 ${binds.length} 个节点`:''),1);loadOut();loadIn();refresh()}else msg(r.msg)}
-
-async function speedAll(){const l=await api('/outbounds');
- if(!l.length)return msg('暂无出站');
- msg(`开始测延迟 ${l.length} 个出站…`,1);
- for(const o of l)speedOut(encodeURIComponent(o.tag));}
-async function speedOut(t0){const t=decodeURIComponent(t0);
- const box=document.getElementById('sp-'+t);
+ if(r.ok){closeM();msg('出站已添加'+(binds.length?`，已绑定 ${binds.length} 个节点`:''),1);loadOut();refresh()}else msg(r.msg)}
+async function speedAll(){const l=await api('/outbounds');if(!l.length)return msg('暂无出站');
+ msg(`开始测延迟 ${l.length} 个出站…`,1);for(const o of l)speedOut(encodeURIComponent(o.tag))}
+async function speedOut(t0){const t=decodeURIComponent(t0);const box=$('sp-'+t);
  if(box)box.innerHTML='<span class="spin"></span> 启动…';
  await api('/speedtest/'+encodeURIComponent(t));
- for(let i=0;i<20;i++){
-   await new Promise(r=>setTimeout(r,1500));
+ for(let i=0;i<20;i++){await new Promise(r=>setTimeout(r,1500));
    let s;try{s=await api('/speed-status/'+encodeURIComponent(t))}catch(e){return}
-   const b=document.getElementById('sp-'+t);if(!b)return;
+   const b=$('sp-'+t);if(!b)return;
    if(s.running){b.innerHTML=`<span class="spin"></span> ${esc(s.step||'测试中')}`;continue}
-   if(s.ok===true){
-     const col=s.latency<=100?'#3ddc84':(s.latency<=250?'#f0c674':'#ff8080');
-     b.innerHTML=`<b style="color:${col}">${s.latency}ms</b>`
-       +(s.best!==s.latency?` <i style="color:#6b7280;font-style:normal;font-size:12px">最快 ${s.best}ms</i>`:'')
-       +(s.total?` <i style="color:#6b7280;font-style:normal;font-size:12px">· 完整往返 ${s.total}ms</i>`:'')
-       +(s.loss?` <span style="color:#ff8080;font-size:12px">丢包 ${s.loss}%</span>`:'')
-       +(s.ip?` <i style="color:#6b7280;font-style:normal;font-size:12px">${esc(s.ip)}</i>`:'');
-     return}
-   if(s.ok===false){b.innerHTML=`<span style="color:#ff8080">${esc(s.msg)}</span>`;return}
- }
- const b=document.getElementById('sp-'+t);if(b)b.textContent='超时';}
-async function editOut(t0){const t=decodeURIComponent(t0);
- const d=await api('/outbound-detail/'+encodeURIComponent(t));
+   if(s.ok===true){const col=s.latency<=100?'var(--ok)':(s.latency<=250?'var(--warn)':'var(--err)');
+     b.innerHTML=`<b style="color:${col}">${s.latency}ms</b>`+(s.best!==s.latency?` <i class="mut" style="font-style:normal;font-size:12px">最快 ${s.best}ms</i>`:'')
+       +(s.total?` <i class="mut" style="font-style:normal;font-size:12px">· 完整往返 ${s.total}ms</i>`:'')+(s.loss?` <span style="color:var(--err);font-size:12px">丢包 ${s.loss}%</span>`:'')
+       +(s.ip?` <i class="mut" style="font-style:normal;font-size:12px">${esc(s.ip)}</i>`:'');return}
+   if(s.ok===false){b.innerHTML=`<span style="color:var(--err)">${esc(s.msg)}</span>`;return}}
+ const b=$('sp-'+t);if(b)b.textContent='超时'}
+async function editOut(t0){const t=decodeURIComponent(t0);const d=await api('/outbound-detail/'+encodeURIComponent(t));
  if(!d.ok)return msg(d.msg||'读取失败');
- document.getElementById('mbox').innerHTML=`<h2>编辑出站 · ${esc(t)}</h2>
-  <p style="color:#8b93a1;font-size:12px;margin-bottom:6px">改名后节点绑定会自动跟随</p>
-  ${obForm(d)}
-  <div class="acts"><button onclick="saveEditOut('${encodeURIComponent(t)}')">保存</button>
-  <button class="btn2" onclick="closeM()">取消</button></div>`;
- document.getElementById('modal').classList.add('show');onKindChange()}
-
-async function saveEditOut(t0){const t=decodeURIComponent(t0);
- const r=await api('/outbound-edit/'+encodeURIComponent(t),'POST',obPayload());
- if(r.ok){closeM();msg('已保存',1);loadOut();loadIn()}else msg(r.msg)}
-
-async function delOut(t0){const t=decodeURIComponent(t0);if(!confirm('删除出站 '+t+'?'))return;const r=await api('/outbounds/'+encodeURIComponent(t),'DELETE');
- if(r.ok){msg('已删除',1);loadOut();loadIn()}else msg(r.msg)}
-async function testOut(t0){const t=decodeURIComponent(t0);(document.getElementById('t-'+t)||{}).textContent='测试中…';const r=await api('/test/'+encodeURIComponent(t));
- (document.getElementById('t-'+t)||{}).textContent=r.msg}
-function bindDlg(tag0,cur0){const tag=decodeURIComponent(tag0),cur=decodeURIComponent(cur0);const o=OUTS.map(x=>`<option value="${x.tag}" ${x.tag===cur?'selected':''}>${x.tag}</option>`).join('');
- document.getElementById('mbox').innerHTML=`<h2>绑定出站</h2><p style="color:#8b93a1;font-size:13px">节点 <b>${tag}</b> 的全部流量将走所选出站</p>
+ openM(`<h2>编辑出站 · ${esc(t)}</h2><p class="mut" style="font-size:12px;margin-bottom:6px">改名后节点绑定会自动跟随</p>${obForm(d)}
+  <div class="acts"><button onclick="saveEditOut('${encodeURIComponent(t)}')">保存</button><button class="btn2" onclick="closeM()">取消</button></div>`);onKindChange()}
+async function saveEditOut(t0){const t=decodeURIComponent(t0);const r=await api('/outbound-edit/'+encodeURIComponent(t),'POST',obPayload());
+ if(r.ok){closeM();msg('已保存',1);loadOut()}else msg(r.msg)}
+async function delOut(t0){const t=decodeURIComponent(t0);if(!confirm('删除出站 '+t+'?'))return;
+ const r=await api('/outbounds/'+encodeURIComponent(t),'DELETE');if(r.ok){msg('已删除',1);loadOut()}else msg(r.msg)}
+async function testOut(t0){const t=decodeURIComponent(t0);const e=$('t-'+t);if(e)e.textContent='测试中…';
+ const r=await api('/test/'+encodeURIComponent(t));const e2=$('t-'+t);if(e2)e2.textContent=r.msg}
+function bindDlg(tag0,cur0){const tag=decodeURIComponent(tag0),cur=decodeURIComponent(cur0);
+ const o=OUTS.map(x=>`<option value="${esc(x.tag)}" ${x.tag===cur?'selected':''}>${esc(x.tag)}</option>`).join('');
+ openM(`<h2>绑定出站</h2><p class="mut" style="font-size:13px">节点 <b>${esc(tag)}</b> 的全部流量将走所选出站</p>
  <label>出站</label><select id="b-out"><option value="direct" ${cur==='direct'?'selected':''}>direct (本机直连)</option>${o}</select>
- <div class="acts"><button onclick="saveBind('${encodeURIComponent(tag)}')">保存</button><button class="btn2" onclick="closeM()">取消</button></div>`;
- document.getElementById('modal').classList.add('show')}
-async function saveBind(tag0){const tag=decodeURIComponent(tag0);const r=await api('/bind','POST',{inbound:tag,outbound:document.getElementById('b-out').value});
+ <div class="acts"><button onclick="saveBind('${encodeURIComponent(tag)}')">保存</button><button class="btn2" onclick="closeM()">取消</button></div>`)}
+async function saveBind(tag0){const tag=decodeURIComponent(tag0);const r=await api('/bind','POST',{inbound:tag,outbound:$('b-out').value});
  if(r.ok){closeM();msg('已更新',1);loadIn()}else msg(r.msg)}
-function newCert(){document.getElementById('mbox').innerHTML=`<h2>申请证书</h2>
- <p style="color:#8b93a1;font-size:13px">域名需已解析到本机，且 80 端口可用</p>
+function newCert(){openM(`<h2>申请证书</h2><p class="mut" style="font-size:13px">域名需已解析到本机；80 端口被 nginx 等占用时会临时停用，签发完自动恢复</p>
  <label>域名</label><input id="c-domain" placeholder="example.com">
- <div class="acts"><button onclick="saveCert(this)">申请</button><button class="btn2" onclick="closeM()">取消</button></div>`;
- document.getElementById('modal').classList.add('show')}
-async function saveCert(b){const d=document.getElementById('c-domain').value.trim();
- if(!d)return msg('请填域名');
- b.disabled=true;b.textContent='提交中…';
- const r=await api('/certs','POST',{domain:d});
+ <div class="acts"><button onclick="saveCert(this)">申请</button><button class="btn2" onclick="closeM()">取消</button></div>`)}
+async function saveCert(b){const d=$('c-domain').value.trim();if(!d)return msg('请填域名');
+ b.disabled=true;b.textContent='提交中…';const r=await api('/certs','POST',{domain:d});
  if(!r.ok){msg(r.msg);b.disabled=false;b.textContent='申请';return}
- document.getElementById('mbox').innerHTML=`<h2>申请证书 · ${esc(d)}</h2>
-  <div id="cstat" class="alert" style="background:#1a1d23;border-color:#2c313a;color:#8b93a1">
-    <span class="spin"></span> 正在预检…</div>
-  <div class="acts"><button class="btn2" onclick="closeM()">后台运行，关闭窗口</button></div>`;
- pollCert()}
-async function pollCert(){
- for(let i=0;i<90;i++){
-   await new Promise(r=>setTimeout(r,2000));
+ $('mbox').innerHTML=`<h2>申请证书 · ${esc(d)}</h2><div id="cstat" class="alert" style="background:var(--bg2);border-color:var(--line2);color:var(--tx2)"><span class="spin"></span> 正在预检…</div>
+  <div class="acts"><button class="btn2" onclick="closeM()">后台运行，关闭窗口</button></div>`;pollCert()}
+async function pollCert(){for(let i=0;i<90;i++){await new Promise(r=>setTimeout(r,2000));
    let s;try{s=await api('/cert-status')}catch(e){return}
-   const box=document.getElementById('cstat');if(!box)return;
+   const box=$('cstat');if(!box)return;
    if(s.running){box.innerHTML=`<span class="spin"></span> ${esc(s.step||'处理中')}… (${(i+1)*2}s)`;continue}
-   if(s.ok===true){box.className='alert';box.style.cssText='background:#16241c;border-color:#2d7f4f;color:#8ff0b5';
-     box.textContent='✓ '+s.msg;CERTS=[];loadCerts();
-     setTimeout(closeM,1500);return}
-   if(s.ok===false){box.className='alert';box.style.cssText='';
-     box.innerHTML='✗ '+esc(s.msg).replace(/\n/g,'<br>');return}
- }
- const box=document.getElementById('cstat');if(box)box.textContent='超时，请查看服务器日志';}
+   if(s.ok===true){box.style.cssText='background:#16241c;border-color:#2d7f4f;color:#8ff0b5';box.textContent='✓ '+s.msg;CERTS=[];loadCerts();setTimeout(closeM,1500);return}
+   if(s.ok===false){box.style.cssText='';box.innerHTML='✗ '+esc(s.msg).replace(/\n/g,'<br>');return}}
+ const box=$('cstat');if(box)box.textContent='超时，请查看服务器日志'}
 async function restart(){const r=await api('/restart','POST');msg(r.ok?'已重启':'失败',r.ok);refresh()}
-// 滚动时给弹窗打标记：期间屏蔽 hover，滚停 120ms 后恢复
-(function(){let t=null;
- document.addEventListener('scroll',e=>{
-   const el=e.target;
-   if(!el||el.nodeType!==1||el.id!=='mbox')return;
-   el.classList.add('scrolling');
-   clearTimeout(t);
-   t=setTimeout(()=>el.classList.remove('scrolling'),120);
- },true);})();
 
-// 弹窗开关时锁/解锁背景页滚动。用观察者兜住所有打开入口，不用逐个改调用点
-(function(){const md=document.getElementById('modal');
- new MutationObserver(()=>{
-   const open=md.classList.contains('show');
-   document.body.classList.toggle('mopen',open);
-   const bx=document.getElementById('mbox');
-   if(open&&bx)bx.scrollTop=0;   // 每次打开都从顶部开始，不留上次的滚动位置
- }).observe(md,{attributes:true,attributeFilter:['class']});})();
+// ════════ 路由规则（参照 s-ui Rules）════════
+let RT=null;
+const ACTS={route:'走出站',reject:'拒绝','hijack-dns':'劫持 DNS',sniff:'嗅探',resolve:'解析域名','route-options':'路由选项'};
+const RS_PRESETS=[
+ ['geosite-category-ads-all','广告域名','https://raw.githubusercontent.com/SagerNet/sing-geosite/rule-set/geosite-category-ads-all.srs'],
+ ['geosite-cn','中国域名','https://raw.githubusercontent.com/SagerNet/sing-geosite/rule-set/geosite-cn.srs'],
+ ['geoip-cn','中国 IP','https://raw.githubusercontent.com/SagerNet/sing-geoip/rule-set/geoip-cn.srs'],
+ ['geosite-openai','OpenAI','https://raw.githubusercontent.com/SagerNet/sing-geosite/rule-set/geosite-openai.srs'],
+ ['geosite-netflix','Netflix','https://raw.githubusercontent.com/SagerNet/sing-geosite/rule-set/geosite-netflix.srs'],
+ ['geosite-google','Google','https://raw.githubusercontent.com/SagerNet/sing-geosite/rule-set/geosite-google.srs'],
+ ['geosite-category-porn','成人网站','https://raw.githubusercontent.com/SagerNet/sing-geosite/rule-set/geosite-category-porn.srs']];
+async function loadRoute(){const r=await api('/route');RT=Object.assign(r,{dirty:false});renderRoute()}
+function arr(v){return v==null?[]:(Array.isArray(v)?v:[v])}
+function ruleSummary(r){const c=[];const add=(l,v)=>{v=arr(v);if(v.length)c.push(`<span class="c" title="${esc(v.join(', '))}">${l}: ${esc(v.slice(0,3).join(', '))}${v.length>3?' …+'+(v.length-3):''}</span>`)};
+ if(r.type==='logical')c.push(`<span class="c">逻辑 ${esc(r.mode||'and')} · ${arr(r.rules).length} 条子规则</span>`);
+ add('入站',r.inbound);add('网络',r.network);add('协议',r.protocol);add('域名',r.domain);add('后缀',r.domain_suffix);
+ add('关键词',r.domain_keyword);add('正则',r.domain_regex);add('IP',r.ip_cidr);add('源IP',r.source_ip_cidr);
+ add('端口',r.port);add('端口范围',r.port_range);add('规则集',r.rule_set);
+ if(r.ip_is_private)c.push('<span class="c">非公开 IP</span>');if(r.clash_mode)add('模式',r.clash_mode);
+ if(r.invert)c.push('<span class="c" style="color:var(--warn)">反选</span>');
+ const known=['inbound','network','protocol','domain','domain_suffix','domain_keyword','domain_regex','ip_cidr','source_ip_cidr','port','port_range','rule_set','ip_is_private','invert','action','outbound','type','mode','rules','clash_mode','method','no_drop','sniffer','timeout','server','strategy'];
+ const other=Object.keys(r).filter(k=>known.indexOf(k)<0);if(other.length)c.push(`<span class="c">${esc(other.join(', '))}</span>`);
+ return c.join('')||'<span class="mut">所有流量</span>'}
+function ruleAct(r){const a=r.action||(r.outbound?'route':'route');
+ if(a==='route')return `<span style="color:var(--pri)">→ ${esc(r.outbound||'?')}</span>`;
+ if(a==='reject')return '<span style="color:var(--err)">拒绝</span>';
+ return `<span style="color:var(--tx2)">${esc(ACTS[a]||a)}</span>`}
+function renderRoute(){const R=RT;const box=$('p-route');
+ const rs=R.rule_set||[];
+ box.innerHTML=`<div class="bar"><button onclick="saveRoute(this)" ${R.dirty?'':'disabled'}>保存并应用</button>
+  ${R.dirty?'<span class="dirty">● 有未保存的修改</span>':''}<span class="sp"></span>
+  <button class="btn2" onclick="loadRoute()">撤销修改</button></div>
+  <div class="note">规则按顺序匹配，命中第一条就停止；都不命中走「默认出站」。保存前会用 sing-box 校验，失败自动回滚。<br>「节点 → 绑定出站」生成的也是这里的规则，两边改动互相可见。</div>
+  <div class="card"><h3>路由规则 <span class="badge">${R.rules.length} 条</span><span class="sp"></span>
+   <select onchange="if(this.value){tplRule(this.value);this.value=''}" style="width:auto;padding:5px 8px;font-size:12.5px">
+    <option value="">快捷模板…</option><option value="ads">屏蔽广告</option><option value="bt">屏蔽 BT 下载</option><option value="cn">屏蔽回国流量（中国 IP）</option><option value="private">屏蔽访问内网</option></select>
+   <button class="btn2 sm" onclick="ruleDlg(-1)">+ 添加规则</button></h3>
+   ${R.rules.length?R.rules.map((r,i)=>`<div class="rule"><span class="ri">${i+1}</span><div class="rb">${ruleSummary(r)}</div><span class="ra">${ruleAct(r)}</span>
+    <div class="ops"><button class="ib" ${i?'':'disabled'} onclick="mvRule(${i},-1)" title="上移">↑</button><button class="ib" ${i<R.rules.length-1?'':'disabled'} onclick="mvRule(${i},1)" title="下移">↓</button>
+    <button class="ib" onclick="ruleDlg(${i})">编辑</button><button class="ib" style="color:var(--err)" onclick="rmRule(${i})">删除</button></div></div>`).join('')
+   :'<div class="empty">没有规则，所有流量走默认出站</div>'}
+   <div class="f2" style="margin-top:6px"><div><label>默认出站 <span class="hint">都不匹配时</span></label>
+    <select onchange="RT.final=this.value;RT.dirty=true;renderRoute()">${R.outbounds.map(o=>`<option ${o===R.final?'selected':''}>${esc(o)}</option>`).join('')}</select></div></div></div>
+  <div class="card"><h3>规则集 <span class="badge">${rs.length} 个</span><span class="sp"></span>
+   <select onchange="if(this.value){addPreset(+this.value);this.value=''}" style="width:auto;padding:5px 8px;font-size:12.5px"><option value="">添加常用规则集…</option>
+    ${RS_PRESETS.map((p,i)=>`<option value="${i}" ${rs.some(x=>x.tag===p[0])?'disabled':''}>${p[1]} (${p[0]})</option>`).join('')}</select>
+   <button class="btn2 sm" onclick="rsDlg(-1)">+ 自定义</button></h3>
+   ${rs.length?`<div class="tw"><table class="tbl"><tr><th>标签</th><th>类型</th><th>来源</th><th>被引用</th><th></th></tr>
+    ${rs.map((x,i)=>{const used=R.rules.filter(r=>arr(r.rule_set).indexOf(x.tag)>=0).length;
+     return `<tr><td><b>${esc(x.tag)}</b></td><td>${esc(x.type||'')} ${x.format?`<span class="mut">· ${esc(x.format)}</span>`:''}</td>
+     <td class="mut" style="max-width:340px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${esc(x.url||x.path||'')}">${esc(x.url||x.path||(x.rules?'内联 '+x.rules.length+' 条':''))}</td>
+     <td>${used?used+' 条规则':'<span class="mut">未使用</span>'}</td>
+     <td style="white-space:nowrap"><button class="ib" onclick="rsDlg(${i})">编辑</button><button class="ib" style="color:var(--err)" onclick="rmRs(${i})">删除</button></td></tr>`}).join('')}</table></div>`
+   :'<div class="mut" style="font-size:12.5px">规则集是可远程更新的域名 / IP 列表，在规则里按标签引用</div>'}</div>`}
+function mvRule(i,d){const a=RT.rules;[a[i],a[i+d]]=[a[i+d],a[i]];RT.dirty=true;renderRoute()}
+function rmRule(i){if(!confirm('删除第 '+(i+1)+' 条规则？'))return;RT.rules.splice(i,1);RT.dirty=true;renderRoute()}
+function rmRs(i){const t=RT.rule_set[i].tag;const used=RT.rules.filter(r=>arr(r.rule_set).indexOf(t)>=0).length;
+ if(used&&!confirm(`规则集 ${t} 被 ${used} 条规则引用，删除后这些规则会校验失败。确定删除？`))return;
+ RT.rule_set.splice(i,1);RT.dirty=true;renderRoute()}
+function addPreset(i){const p=RS_PRESETS[i];if(RT.rule_set.some(x=>x.tag===p[0]))return;
+ RT.rule_set.push({tag:p[0],type:'remote',format:'binary',url:p[2]});RT.dirty=true;renderRoute();msg('已添加规则集 '+p[0]+'，在规则里引用它即可',1)}
+function tplRule(k){const ensure=i=>{const p=RS_PRESETS[i];if(!RT.rule_set.some(x=>x.tag===p[0]))RT.rule_set.push({tag:p[0],type:'remote',format:'binary',url:p[2]})};
+ let r;if(k==='ads'){ensure(0);r={rule_set:['geosite-category-ads-all'],action:'reject'}}
+ if(k==='bt')r={protocol:['bittorrent'],action:'reject'};
+ if(k==='cn'){ensure(2);r={rule_set:['geoip-cn'],action:'reject'}}
+ if(k==='private')r={ip_is_private:true,action:'reject'};
+ const at=RT.rules.findIndex(x=>x.action==='sniff')+1;RT.rules.splice(at,0,r);RT.dirty=true;renderRoute();msg('已添加，记得点「保存并应用」',1)}
+async function saveRoute(b){b.disabled=true;b.textContent='应用中…';
+ const r=await api('/route','POST',{rules:RT.rules,rule_set:RT.rule_set,final:RT.final});
+ b.textContent='保存并应用';if(r.ok){msg(r.msg,1);loadRoute()}else{b.disabled=false;msg(r.msg)}}
+// 规则编辑：表单 + JSON，两边可切换；表单不认识的字段原样保留
+const RF_LIST=[['domain','完整域名'],['domain_suffix','域名后缀'],['domain_keyword','域名关键词'],['domain_regex','域名正则'],['ip_cidr','目标 IP / CIDR'],['source_ip_cidr','来源 IP / CIDR'],['port','目标端口'],['port_range','端口范围 (如 1000:2000)']];
+const PROTO_OPTS=['http','tls','quic','dns','bittorrent','stun','dtls','ssh','rdp'];
+let RE=null;
+function ruleDlg(i){const r=i>=0?JSON.parse(JSON.stringify(RT.rules[i])):{action:'route',outbound:RT.final||'direct'};
+ RE={i,r};const logical=r.type==='logical';
+ openM(`<h2>${i>=0?'编辑规则 #'+(i+1):'添加规则'}</h2>
+  <div class="mtabs"><div class="mtab ${logical?'':'active'}" data-t="f" onclick="ruleTab('f')">表单</div><div class="mtab ${logical?'active':''}" data-t="j" onclick="ruleTab('j')">JSON</div></div>
+  <div id="mt-f" style="${logical?'display:none':''}"></div>
+  <div id="mt-j" style="${logical?'':'display:none'}"><label>规则 JSON <span class="hint">逻辑规则等高级写法在这里改</span></label><textarea id="rj" rows="14"></textarea></div>
+  <div class="acts"><button onclick="saveRule()">确定</button><button class="btn2" onclick="closeM()">取消</button><span class="mut" style="font-size:12px">确定后还需「保存并应用」</span></div>`,1);
+ if(logical){$('rj').value=JSON.stringify(r,null,2);RE.tab='j'}else{RE.tab='f';ruleForm()}}
+function ruleForm(){const r=RE.r;const a=r.action||'route';
+ const ins=RT.inbounds.map(t=>`<label class="chk"><input type="checkbox" class="ri-in" value="${esc(t)}" ${arr(r.inbound).indexOf(t)>=0?'checked':''}><span>${esc(t)}</span></label>`).join('');
+ const rss=(RT.rule_set||[]).map(x=>`<label class="chk"><input type="checkbox" class="ri-rs" value="${esc(x.tag)}" ${arr(r.rule_set).indexOf(x.tag)>=0?'checked':''}><span>${esc(x.tag)}</span></label>`).join('');
+ $('mt-f').innerHTML=`<div class="f2"><div><label>动作</label><select id="ri-act" onchange="RE.r.action=this.value;ruleRead();ruleForm()">
+   ${Object.entries(ACTS).map(([k,v])=>`<option value="${k}" ${k===a?'selected':''}>${v} (${k})</option>`).join('')}</select></div>
+  <div>${a==='route'?`<label>出站</label><select id="ri-out">${RT.outbounds.map(o=>`<option ${o===r.outbound?'selected':''}>${esc(o)}</option>`).join('')}</select>`:''}</div></div>
+  <p class="mut" style="font-size:12px;margin-top:8px">下面的条件全部留空 = 匹配所有流量。同一类里多项是「或」，不同类之间是「且」。</p>
+  <div class="f2"><div><label>入站（节点）</label><div class="chkbox" style="max-height:150px">${ins||'<span class="mut" style="font-size:12px">无</span>'}</div></div>
+   <div><label>规则集</label><div class="chkbox" style="max-height:150px">${rss||'<span class="mut" style="font-size:12px;padding:6px;display:block">还没有规则集，先在页面上添加</span>'}</div></div></div>
+  <div class="f2"><div><label>网络</label><select id="ri-net"><option value="">不限</option><option value="tcp" ${r.network==='tcp'?'selected':''}>TCP</option><option value="udp" ${r.network==='udp'?'selected':''}>UDP</option></select></div>
+   <div><label>协议 <span class="hint">需要嗅探</span></label><div class="chkbox" style="max-height:110px;display:flex;flex-wrap:wrap">${PROTO_OPTS.map(p=>`<label class="chk" style="padding:4px 8px"><input type="checkbox" class="ri-pr" value="${p}" ${arr(r.protocol).indexOf(p)>=0?'checked':''}><span>${p}</span></label>`).join('')}</div></div></div>
+  <div class="f2">${RF_LIST.map(([k,l])=>`<div><label>${l} <span class="hint">每行一项</span></label><textarea id="ri-${k}" rows="2">${esc(arr(r[k]).join('\n'))}</textarea></div>`).join('')}</div>
+  <label class="chk" style="margin-top:8px"><input type="checkbox" id="ri-priv" ${r.ip_is_private?'checked':''}><span>匹配非公开 IP</span><i>内网 / 本机地址</i></label>
+  <label class="chk"><input type="checkbox" id="ri-inv" ${r.invert?'checked':''}><span>反选结果</span><i>条件不满足时才命中</i></label>`}
+function ruleRead(){if(RE.tab!=='f'||!$('ri-act'))return;const r=RE.r;const set=(k,v)=>{if(v==null||v===''||(Array.isArray(v)&&!v.length)||v===false)delete r[k];else r[k]=v};
+ const chk=c=>[...document.querySelectorAll('.'+c+':checked')].map(e=>e.value);
+ r.action=$('ri-act').value;
+ if(r.action==='route'&&$('ri-out'))r.outbound=$('ri-out').value;else delete r.outbound;
+ set('inbound',chk('ri-in'));set('rule_set',chk('ri-rs'));set('network',$('ri-net').value);set('protocol',chk('ri-pr'));
+ RF_LIST.forEach(([k])=>{let v=$('ri-'+k).value.split('\n').map(s=>s.trim()).filter(Boolean);
+  if(k==='port')v=v.map(x=>+x).filter(x=>x>0&&x<65536);set(k,v)});
+ set('ip_is_private',$('ri-priv').checked);set('invert',$('ri-inv').checked);
+ if(r.action==='route'&&!r.outbound)r.outbound='direct'}
+function ruleTab(t){if(t===RE.tab)return;
+ if(t==='j'){ruleRead();$('rj').value=JSON.stringify(RE.r,null,2)}
+ else{let o;try{o=JSON.parse($('rj').value)}catch(e){return msg('JSON 格式错误：'+e.message)}
+  if(o.type==='logical')return msg('逻辑规则只能用 JSON 编辑');RE.r=o;ruleForm()}
+ RE.tab=t;document.querySelectorAll('.mtab').forEach(e=>e.classList.toggle('active',e.dataset.t===t));
+ $('mt-f').style.display=t==='f'?'':'none';$('mt-j').style.display=t==='j'?'':'none'}
+function saveRule(){let r;if(RE.tab==='j'){try{r=JSON.parse($('rj').value)}catch(e){return msg('JSON 格式错误：'+e.message)}}
+ else{ruleRead();r=RE.r}
+ if(typeof r!=='object'||Array.isArray(r))return msg('规则必须是一个 JSON 对象');
+ if(r.action==='route'||(!r.action&&r.outbound)){if(r.action==='route'&&!r.outbound)return msg('请选择出站')}
+ if(RE.i>=0)RT.rules[RE.i]=r;else{const at=RT.rules.length;RT.rules.splice(at,0,r)}
+ RT.dirty=true;closeM();renderRoute()}
+function rsDlg(i){const x=i>=0?RT.rule_set[i]:{type:'remote',format:'binary'};
+ openM(`<h2>${i>=0?'编辑规则集':'添加规则集'}</h2>
+  <div class="f2"><div><label>标签</label><input id="rs-tag" value="${esc(x.tag||'')}" placeholder="如 geosite-openai"></div>
+   <div><label>类型</label><select id="rs-type" onchange="$('rs-r').style.display=this.value==='remote'?'':'none';$('rs-l').style.display=this.value==='local'?'':'none'">
+    <option value="remote" ${x.type==='remote'?'selected':''}>远程 (remote)</option><option value="local" ${x.type==='local'?'selected':''}>本地文件 (local)</option></select></div></div>
+  <div class="f2"><div><label>格式</label><select id="rs-fmt"><option value="binary" ${x.format!=='source'?'selected':''}>binary (.srs)</option><option value="source" ${x.format==='source'?'selected':''}>source (.json)</option></select></div>
+   <div id="rs-r2"><label>更新间隔 <span class="hint">默认 1d</span></label><input id="rs-iv" value="${esc(x.update_interval||'')}" placeholder="1d"></div></div>
+  <div id="rs-r" style="${x.type==='remote'?'':'display:none'}"><label>下载地址</label><input id="rs-url" value="${esc(x.url||'')}" placeholder="https://…/geosite-xxx.srs"></div>
+  <div id="rs-l" style="${x.type==='local'?'':'display:none'}"><label>文件路径</label><input id="rs-path" value="${esc(x.path||'')}" placeholder="/etc/sing-box/xxx.srs"></div>
+  <div class="acts"><button onclick="saveRs(${i})">确定</button><button class="btn2" onclick="closeM()">取消</button></div>`)}
+function saveRs(i){const tag=$('rs-tag').value.trim(),type=$('rs-type').value;if(!tag)return msg('请填标签');
+ if(RT.rule_set.some((x,j)=>x.tag===tag&&j!==i))return msg('标签已存在');
+ const o=i>=0?Object.assign({},RT.rule_set[i]):{};o.tag=tag;o.type=type;o.format=$('rs-fmt').value;
+ if(type==='remote'){o.url=$('rs-url').value.trim();if(!o.url)return msg('请填下载地址');delete o.path;const iv=$('rs-iv').value.trim();if(iv)o.update_interval=iv;else delete o.update_interval}
+ else{o.path=$('rs-path').value.trim();if(!o.path)return msg('请填文件路径');delete o.url;delete o.update_interval}
+ const old=i>=0?RT.rule_set[i].tag:null;
+ if(i>=0){RT.rule_set[i]=o;if(old!==tag)RT.rules.forEach(r=>{if(r.rule_set){r.rule_set=arr(r.rule_set).map(t=>t===old?tag:t)}})}else RT.rule_set.push(o);
+ RT.dirty=true;closeM();renderRoute()}
 
-// 仅当「按下」和「松开」都在遮罩上才关闭——避免拖选文字时误关
+// ════════ DNS（参照 s-ui DNS）════════
+let DN=null;
+const DNS_TYPES=[['local','系统 DNS'],['udp','UDP'],['tcp','TCP'],['tls','DNS over TLS'],['https','DNS over HTTPS'],['h3','DNS over HTTP/3'],['quic','DNS over QUIC']];
+async function loadDns(){const r=await api('/dns');DN=Object.assign(r,{dirty:false});DN.dns=DN.dns||{};renderDns()}
+function renderDns(){const D=DN.dns;const sv=D.servers||[],ru=D.rules||[];const box=$('p-dns');const tags=sv.map(s=>s.tag);
+ box.innerHTML=`<div class="bar"><button onclick="saveDns(this)" ${DN.dirty?'':'disabled'}>保存并应用</button>
+  ${DN.dirty?'<span class="dirty">● 有未保存的修改</span>':''}<span class="sp"></span><button class="btn2" onclick="loadDns()">撤销修改</button></div>
+  <div class="note">服务端的 DNS 决定 sing-box 解析目标域名时找谁。不配置时用系统 DNS，大多数情况不用改。<br>配置了多个服务器时，必须指定「出站解析服务器」（sing-box 1.12 起的要求），保存时会自动补上。</div>
+  <div class="card"><h3>基本设置</h3>
+   <div class="f3"><div><label>默认服务器 <span class="hint">都不匹配时</span></label><select onchange="dnsSet('final',this.value)"><option value="">第一个服务器</option>${tags.map(t=>`<option ${t===D.final?'selected':''}>${esc(t)}</option>`).join('')}</select></div>
+    <div><label>出站解析服务器 <span class="hint">节点连目标时用</span></label><select onchange="DN.resolver=this.value;DN.dirty=true;renderDns()"><option value="">自动</option>${tags.map(t=>`<option ${t===DN.resolver?'selected':''}>${esc(t)}</option>`).join('')}</select></div>
+    <div><label>解析策略</label><select onchange="dnsSet('strategy',this.value)">${[['','默认'],['prefer_ipv4','优先 IPv4'],['prefer_ipv6','优先 IPv6'],['ipv4_only','仅 IPv4'],['ipv6_only','仅 IPv6']].map(([v,l])=>`<option value="${v}" ${(D.strategy||'')===v?'selected':''}>${l}</option>`).join('')}</select></div></div>
+   <div class="f2"><div><label>缓存容量 <span class="hint">条，小于 1024 无效</span></label><input type="number" value="${D.cache_capacity||''}" placeholder="默认" onchange="dnsSet('cache_capacity',this.value?+this.value:'')"></div>
+    <div><label>&nbsp;</label><label class="chk"><input type="checkbox" ${D.disable_cache?'checked':''} onchange="dnsSet('disable_cache',this.checked)"><span>禁用缓存</span></label></div></div></div>
+  <div class="card"><h3>服务器 <span class="badge">${sv.length} 个</span><span class="sp"></span><button class="btn2 sm" onclick="dsDlg(-1)">+ 添加服务器</button></h3>
+   ${sv.length?`<div class="tw"><table class="tbl"><tr><th>标签</th><th>类型</th><th>地址</th><th>经由出站</th><th></th></tr>
+    ${sv.map((s,i)=>`<tr><td><b>${esc(s.tag)}</b>${s.tag===(D.final||tags[0])?' <span class="badge b">默认</span>':''}</td><td>${esc(s.type||'')}</td>
+     <td class="mut">${esc(s.server||'')}${s.server_port?':'+s.server_port:''}</td><td class="mut">${esc(s.detour||'直连')}</td>
+     <td style="white-space:nowrap"><button class="ib" ${i?'':'disabled'} onclick="mvDs(${i},-1)">↑</button><button class="ib" onclick="dsDlg(${i})">编辑</button><button class="ib" style="color:var(--err)" onclick="rmDs(${i})">删除</button></td></tr>`).join('')}</table></div>`
+   :'<div class="mut" style="font-size:12.5px">未配置，使用系统 DNS</div>'}</div>
+  <div class="card"><h3>DNS 规则 <span class="badge">${ru.length} 条</span><span class="sp"></span><button class="btn2 sm" ${sv.length?'':'disabled'} onclick="drDlg(-1)">+ 添加规则</button></h3>
+   ${ru.length?ru.map((r,i)=>`<div class="rule"><span class="ri">${i+1}</span><div class="rb">${ruleSummary(r)}${r.query_type?`<span class="c">类型: ${esc(arr(r.query_type).join(', '))}</span>`:''}</div>
+    <span class="ra">${r.action==='reject'?'<span style="color:var(--err)">拒绝</span>':`<span style="color:var(--pri)">→ ${esc(r.server||'?')}</span>`}</span>
+    <div class="ops"><button class="ib" ${i?'':'disabled'} onclick="mvDr(${i},-1)">↑</button><button class="ib" ${i<ru.length-1?'':'disabled'} onclick="mvDr(${i},1)">↓</button>
+    <button class="ib" onclick="drDlg(${i})">编辑</button><button class="ib" style="color:var(--err)" onclick="rmDr(${i})">删除</button></div></div>`).join('')
+   :'<div class="mut" style="font-size:12.5px">没有规则，所有查询走默认服务器</div>'}</div>`}
+function dnsSet(k,v){if(v===''||v==null||v===false)delete DN.dns[k];else DN.dns[k]=v;DN.dirty=true;renderDns()}
+function mvDs(i,d){const a=DN.dns.servers;[a[i],a[i+d]]=[a[i+d],a[i]];DN.dirty=true;renderDns()}
+function rmDs(i){const t=DN.dns.servers[i].tag;if(!confirm('删除 DNS 服务器 '+t+'？'))return;DN.dns.servers.splice(i,1);
+ if(DN.dns.final===t)delete DN.dns.final;if(DN.resolver===t)DN.resolver='';DN.dirty=true;renderDns()}
+function mvDr(i,d){const a=DN.dns.rules;[a[i],a[i+d]]=[a[i+d],a[i]];DN.dirty=true;renderDns()}
+function rmDr(i){if(!confirm('删除第 '+(i+1)+' 条 DNS 规则？'))return;DN.dns.rules.splice(i,1);DN.dirty=true;renderDns()}
+function dsDlg(i){const s=i>=0?DN.dns.servers[i]:{type:'https'};
+ openM(`<h2>${i>=0?'编辑 DNS 服务器':'添加 DNS 服务器'}</h2>
+  <div class="f2"><div><label>标签</label><input id="ds-tag" value="${esc(s.tag||'')}" placeholder="如 cloudflare"></div>
+   <div><label>类型</label><select id="ds-type" onchange="$('ds-addr').style.display=this.value==='local'?'none':''">${DNS_TYPES.map(([v,l])=>`<option value="${v}" ${s.type===v?'selected':''}>${l} (${v})</option>`).join('')}</select></div></div>
+  <div id="ds-addr" style="${s.type==='local'?'display:none':''}"><div class="f2"><div><label>服务器地址</label><input id="ds-srv" value="${esc(s.server||'')}" placeholder="1.1.1.1"></div>
+   <div><label>端口 <span class="hint">留空用默认</span></label><input id="ds-port" type="number" value="${s.server_port||''}"></div></div>
+   <label>经由出站 <span class="hint">留空直连</span></label><select id="ds-det"><option value="">直连</option>${DN.outbounds.filter(o=>o!=='direct').map(o=>`<option ${o===s.detour?'selected':''}>${esc(o)}</option>`).join('')}</select></div>
+  <div class="acts"><button onclick="saveDs(${i})">确定</button><button class="btn2" onclick="closeM()">取消</button></div>`)}
+function saveDs(i){const tag=$('ds-tag').value.trim();if(!tag)return msg('请填标签');
+ const sv=DN.dns.servers=DN.dns.servers||[];if(sv.some((x,j)=>x.tag===tag&&j!==i))return msg('标签已存在');
+ const o=i>=0?Object.assign({},sv[i]):{};const old=i>=0?sv[i].tag:null;o.tag=tag;o.type=$('ds-type').value;
+ if(o.type==='local'){delete o.server;delete o.server_port;delete o.detour}
+ else{o.server=$('ds-srv').value.trim();if(!o.server)return msg('请填服务器地址');const p=+$('ds-port').value;if(p)o.server_port=p;else delete o.server_port;
+  const d=$('ds-det').value;if(d)o.detour=d;else delete o.detour}
+ if(i>=0){sv[i]=o;if(old!==tag){(DN.dns.rules||[]).forEach(r=>{if(r.server===old)r.server=tag});if(DN.dns.final===old)DN.dns.final=tag;if(DN.resolver===old)DN.resolver=tag}}else sv.push(o);
+ DN.dirty=true;closeM();renderDns()}
+let DRE=null;
+function drDlg(i){const r=i>=0?JSON.parse(JSON.stringify(DN.dns.rules[i])):{server:(DN.dns.servers[0]||{}).tag};DRE={i,r};
+ const tags=(DN.dns.servers||[]).map(s=>s.tag);
+ openM(`<h2>${i>=0?'编辑 DNS 规则 #'+(i+1):'添加 DNS 规则'}</h2>
+  <div class="mtabs"><div class="mtab active" data-t="f" onclick="drTab('f')">表单</div><div class="mtab" data-t="j" onclick="drTab('j')">JSON</div></div>
+  <div id="mt-f"><div class="f2"><div><label>动作</label><select id="dr-act"><option value="route" ${r.action!=='reject'?'selected':''}>交给服务器</option><option value="reject" ${r.action==='reject'?'selected':''}>拒绝</option></select></div>
+   <div><label>服务器</label><select id="dr-srv">${tags.map(t=>`<option ${t===r.server?'selected':''}>${esc(t)}</option>`).join('')}</select></div></div>
+   <div class="f2">${[['domain','完整域名'],['domain_suffix','域名后缀'],['domain_keyword','域名关键词'],['domain_regex','域名正则']].map(([k,l])=>`<div><label>${l} <span class="hint">每行一项</span></label><textarea id="dr-${k}" rows="2">${esc(arr(r[k]).join('\n'))}</textarea></div>`).join('')}</div>
+   <div class="f2"><div><label>查询类型 <span class="hint">如 A、AAAA、HTTPS，逗号分隔</span></label><input id="dr-qt" value="${esc(arr(r.query_type).join(', '))}"></div>
+    <div><label>规则集</label><select id="dr-rs" multiple style="height:72px">${(DN.rule_sets||[]).map(t=>`<option ${arr(r.rule_set).indexOf(t)>=0?'selected':''}>${esc(t)}</option>`).join('')}</select></div></div>
+   <label class="chk" style="margin-top:8px"><input type="checkbox" id="dr-inv" ${r.invert?'checked':''}><span>反选结果</span></label></div>
+  <div id="mt-j" style="display:none"><textarea id="drj" rows="12"></textarea></div>
+  <div class="acts"><button onclick="saveDr()">确定</button><button class="btn2" onclick="closeM()">取消</button><span class="mut" style="font-size:12px">确定后还需「保存并应用」</span></div>`,1);DRE.tab='f'}
+function drRead(){if(DRE.tab!=='f')return;const r=DRE.r;const set=(k,v)=>{if(v==null||v===''||(Array.isArray(v)&&!v.length)||v===false)delete r[k];else r[k]=v};
+ const a=$('dr-act').value;if(a==='reject'){r.action='reject';delete r.server}else{delete r.action;r.server=$('dr-srv').value}
+ ['domain','domain_suffix','domain_keyword','domain_regex'].forEach(k=>set(k,$('dr-'+k).value.split('\n').map(s=>s.trim()).filter(Boolean)));
+ set('query_type',$('dr-qt').value.split(/[,，\s]+/).map(s=>s.trim().toUpperCase()).filter(Boolean));
+ set('rule_set',[...$('dr-rs').selectedOptions].map(o=>o.value));set('invert',$('dr-inv').checked)}
+function drTab(t){if(t===DRE.tab)return;
+ if(t==='j'){drRead();$('drj').value=JSON.stringify(DRE.r,null,2)}else{try{DRE.r=JSON.parse($('drj').value)}catch(e){return msg('JSON 格式错误：'+e.message)}drDlg2()}
+ DRE.tab=t;document.querySelectorAll('.mtab').forEach(e=>e.classList.toggle('active',e.dataset.t===t));
+ $('mt-f').style.display=t==='f'?'':'none';$('mt-j').style.display=t==='j'?'':'none'}
+function drDlg2(){const keep=DRE.r,i=DRE.i;drDlg(i);DRE.r=keep;const r=keep;
+ $('dr-act').value=r.action==='reject'?'reject':'route';if(r.server)$('dr-srv').value=r.server;
+ ['domain','domain_suffix','domain_keyword','domain_regex'].forEach(k=>$('dr-'+k).value=arr(r[k]).join('\n'));
+ $('dr-qt').value=arr(r.query_type).join(', ');$('dr-inv').checked=!!r.invert}
+function saveDr(){let r;if(DRE.tab==='j'){try{r=JSON.parse($('drj').value)}catch(e){return msg('JSON 格式错误：'+e.message)}}else{drRead();r=DRE.r}
+ const ru=DN.dns.rules=DN.dns.rules||[];if(DRE.i>=0)ru[DRE.i]=r;else ru.push(r);DN.dirty=true;closeM();renderDns()}
+async function saveDns(b){b.disabled=true;b.textContent='应用中…';
+ const r=await api('/dns','POST',{dns:DN.dns,resolver:DN.resolver||''});
+ b.textContent='保存并应用';if(r.ok){msg(r.msg,1);loadDns()}else{b.disabled=false;msg(r.msg)}}
+
+// ════════ 设置 ════════
+async function loadSet(){let d={};try{d=await api('/dashboard')}catch(e){}
+ const st=d.stats||{};
+ $('p-set').innerHTML=`<div class="grid2">
+  <div class="card"><h3>备份与恢复</h3>
+   <p class="mut" style="font-size:12.5px;margin-bottom:6px">备份包含 sing-box 配置、节点信息、用户和订阅地址；不含面板登录密码和证书文件。</p>
+   <div class="acts"><button onclick="doBackup()">下载备份</button>
+    <label class="btn2" style="display:inline-block;margin:0;padding:8px 15px;border-radius:var(--r2);cursor:pointer;font-size:13.5px;color:var(--tx)">从文件恢复…<input type="file" accept=".json,application/json" style="display:none" onchange="doRestore(this)"></label></div></div>
+  <div class="card"><h3>流量统计 ${st.disabled?'<span class="badge">已关闭</span>':'<span class="badge g">已开启</span>'}</h3>
+   <p class="mut" style="font-size:12.5px">累计流量用 iptables 按端口精确计数（只计数、不拦截）；当前连接数和在线 IP 读取 sing-box 只监听本机的 Clash API。</p>
+   <div class="row"><span>计数方式</span><span>${st.mode==='iptables'?'<span class="badge g">iptables 精确计数</span>':`<span class="badge y">Clash API 估算</span>`}</span></div>
+   ${st.acct_err&&st.mode!=='iptables'?`<div class="row"><span>原因</span><span class="mut">${esc(st.acct_err)}</span></div>`:''}
+   <div class="acts"><button class="${st.disabled?'':'btnd'}" onclick="toggleStats(${st.disabled?1:0})">${st.disabled?'开启流量统计':'关闭流量统计'}</button></div>
+   <p class="mut" style="font-size:12px;margin-top:8px">开关会重启一次 sing-box</p></div>
+  <div class="card"><h3>面板访问</h3><p class="mut" style="font-size:12.5px">访问路径和 HTTPS 在「证书」页设置。</p>
+   <div class="acts"><button class="btn2" onclick="pathDlg()">更换访问路径</button><button class="btn2" onclick="go('cert')">前往证书页</button></div></div>
+ </div>`}
+async function doBackup(){const r=await fetch(BASE+'/api/backup',{headers:{'X-Token':TK}});if(!r.ok)return msg('备份失败');
+ const blob=await r.blob();const a=document.createElement('a');a.href=URL.createObjectURL(blob);
+ a.download=(r.headers.get('Content-Disposition')||'').match(/filename="([^"]+)"/)?.[1]||'sb-panel-backup.json';
+ document.body.appendChild(a);a.click();setTimeout(()=>{URL.revokeObjectURL(a.href);a.remove()},1000);msg('已下载备份',1)}
+async function doRestore(inp){const f=inp.files[0];inp.value='';if(!f)return;let bk;
+ try{bk=JSON.parse(await f.text())}catch(e){return msg('文件不是有效的 JSON')}
+ if(!bk||bk.app!=='sb-panel')return msg('不是本面板导出的备份文件');
+ if(!confirm(`用 ${bk.time||'该'} 的备份覆盖当前配置？\n\n节点 ${(bk.config.inbounds||[]).length} 个，用户 ${((bk.users||{}).users||[]).length} 个。会重启 sing-box，失败自动回滚。`))return;
+ msg('恢复中…',1);const r=await api('/restore','POST',{backup:bk});msg(r.msg,r.ok);if(r.ok){refresh();loadSet()}}
+async function toggleStats(on){if(!on&&!confirm('关闭后首页不再显示节点流量和连接数，确定？'))return;
+ const r=await api('/stats-toggle','POST',{on:!!on});msg(r.msg,r.ok);loadSet()}
+
+// ── 弹窗通用行为 ──
+(function(){let t=null;document.addEventListener('scroll',e=>{const el=e.target;if(!el||el.nodeType!==1||el.id!=='mbox')return;
+ el.classList.add('scrolling');clearTimeout(t);t=setTimeout(()=>el.classList.remove('scrolling'),120)},true)})();
+(function(){const md=$('modal');new MutationObserver(()=>{const open=md.classList.contains('show');
+ document.body.classList.toggle('mopen',open);const bx=$('mbox');if(open&&bx)bx.scrollTop=0}).observe(md,{attributes:true,attributeFilter:['class']})})();
 let _mdOnMask=false;
-document.getElementById('modal').addEventListener('mousedown',e=>{_mdOnMask=(e.target.id==='modal')});
-document.getElementById('modal').addEventListener('click',e=>{
- if(e.target.id==='modal'&&_mdOnMask)closeM();_mdOnMask=false});
+$('modal').addEventListener('mousedown',e=>{_mdOnMask=(e.target.id==='modal')});
+$('modal').addEventListener('click',e=>{if(e.target.id==='modal'&&_mdOnMask)closeM();_mdOnMask=false});
+document.addEventListener('keydown',e=>{if(e.key==='Escape'&&$('modal').classList.contains('show'))closeM()});
+window.addEventListener('beforeunload',e=>{if((RT&&RT.dirty)||(DN&&DN.dirty)){e.preventDefault();e.returnValue=''}});
 (async()=>{if(TK){try{await api('/status');show(1)}catch(e){show(0)}}else show(0)})();
 </script></body></html>"""
 
@@ -3427,7 +4820,36 @@ class Handler(QuietMixin, BaseHTTPRequestHandler):
                 return self._send(200, {"ok": True, "tag": t, "proto": proto,
                                         "fields": fields,
                                         "port": ib.get("listen_port"),
-                                        "name": info.get("name", t)})
+                                        "name": info.get("name", t),
+                                        "users": [u["name"] for u in load_users()["users"]
+                                                  if t in (u.get("inbounds") or [])]})
+            if p == "/api/dashboard":
+                return self._send(200, api_dashboard())
+            if p == "/api/users":
+                return self._send(200, api_users())
+            if p.startswith("/api/user-links/"):
+                n = urllib.parse.unquote(p[len("/api/user-links/"):])
+                u = next((x for x in load_users()["users"] if x["name"] == n), None)
+                if not u:
+                    return self._send(200, {"ok": False, "msg": "用户不存在"})
+                return self._send(200, {"ok": True, "links": user_links(u),
+                                        "sub": sub_base_url() + u["sub"]})
+            if p == "/api/route":
+                return self._send(200, api_route_get())
+            if p == "/api/dns":
+                return self._send(200, api_dns_get())
+            if p == "/api/backup":
+                body = json.dumps(api_backup(), ensure_ascii=False, indent=2).encode()
+                self._sent = True
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json; charset=utf-8")
+                self.send_header("Content-Disposition",
+                                 f'attachment; filename="sb-panel-{time.strftime("%Y%m%d-%H%M")}.json"')
+                self.send_header("Content-Length", str(len(body)))
+                self.send_header("Cache-Control", "no-store")
+                self.end_headers()
+                self.wfile.write(body)
+                return
             if p == "/api/certs":
                 pc = load_json(PANEL_CFG, {})
                 return self._send(200, {"certs": list_certs(),
@@ -3551,6 +4973,38 @@ class Handler(QuietMixin, BaseHTTPRequestHandler):
                 return self._send(200, {"ok": okk, "msg": r if not okk else "已保存"})
             if p == "/api/bind":
                 okk, r = api_bind(b.get("inbound"), b.get("outbound"))
+                return self._send(200, {"ok": okk, "msg": r})
+            if p == "/api/users":
+                okk, r = api_user_save("", b, True)
+                return self._send(200, {"ok": okk, "msg": r})
+            if p.startswith("/api/user-edit/"):
+                n = urllib.parse.unquote(p[len("/api/user-edit/"):])
+                okk, r = api_user_save(n, b, False)
+                return self._send(200, {"ok": okk, "msg": r})
+            if p == "/api/users-bulk":
+                okk, r = api_users_bulk(b)
+                return self._send(200, {"ok": okk, "msg": r})
+            if p == "/api/users-del":
+                okk, r = api_user_del(b.get("names") or [])
+                return self._send(200, {"ok": okk, "msg": r})
+            if p.startswith("/api/user-reset/"):
+                n = urllib.parse.unquote(p[len("/api/user-reset/"):])
+                okk, r = api_user_reset(n, b.get("what", "sub"))
+                return self._send(200, {"ok": okk, "msg": r})
+            if p == "/api/route":
+                okk, r = api_route_set(b)
+                return self._send(200, {"ok": okk, "msg": r})
+            if p == "/api/dns":
+                okk, r = api_dns_set(b)
+                return self._send(200, {"ok": okk, "msg": r})
+            if p == "/api/restore":
+                okk, r = api_restore(b)
+                return self._send(200, {"ok": okk, "msg": r})
+            if p == "/api/stats-reset":
+                okk, r = api_stats_reset(b.get("tag") or "")
+                return self._send(200, {"ok": okk, "msg": r})
+            if p == "/api/stats-toggle":
+                okk, r = api_stats_toggle(bool(b.get("on")))
                 return self._send(200, {"ok": okk, "msg": r})
             if p == "/api/certs":
                 d = (b.get("domain") or "").strip()
@@ -3680,6 +5134,10 @@ class Handler(QuietMixin, BaseHTTPRequestHandler):
                 tag = urllib.parse.unquote(p[len("/api/outbounds/"):])
                 okk, m = api_del_outbound(tag)
                 return self._send(200, {"ok": okk, "msg": m})
+            if p.startswith("/api/users/"):
+                n = urllib.parse.unquote(p[len("/api/users/"):])
+                okk, m = api_user_del([n])
+                return self._send(200, {"ok": okk, "msg": m})
         return self._send(404, {"ok": False})
 
 
@@ -3716,8 +5174,9 @@ class SubHandler(QuietMixin, BaseHTTPRequestHandler):
         token = u.path.lstrip("/")
         qs = urllib.parse.parse_qs(u.query)
         real = sub_token()
-
-        if not token or token != real:
+        user = None if token == real else find_user_by_sub(token)
+        # 停用或到期的用户和不存在的 token 一样返回 404，不泄露它曾经存在
+        if not token or (token != real and not (user and user_active(user))):
             body = b"Not Found"
             self.send_response(404)
             self.send_header("Content-Type", "text/plain; charset=utf-8")
@@ -3726,8 +5185,11 @@ class SubHandler(QuietMixin, BaseHTTPRequestHandler):
             self.wfile.write(body)
             return
 
-        m = meta()
-        uris = [v["uri"] for v in m.values() if v.get("uri")]
+        if user:
+            uris = [x["uri"] for x in user_links(user)]
+        else:
+            m = meta()
+            uris = [v["uri"] for v in m.values() if v.get("uri")]
         plain = "\n".join(uris)
         # ?plain=1 返回明文，默认 base64（各客户端通用）
         content = plain if qs.get("plain") else base64.b64encode(plain.encode()).decode()
@@ -3739,10 +5201,10 @@ class SubHandler(QuietMixin, BaseHTTPRequestHandler):
         self.send_header("Content-Disposition", "inline")
         self.send_header("Cache-Control", "no-store")
         self.send_header("Profile-Update-Interval", "24")
-        self.send_header("Profile-Title",
-                         base64.b64encode("sing-box".encode()).decode())
+        title = f"sing-box · {user['name']}" if user else "sing-box"
+        self.send_header("Profile-Title", "base64:" + base64.b64encode(title.encode()).decode())
         self.send_header("Subscription-Userinfo",
-                         "upload=0; download=0; total=0; expire=0")
+                         f"upload=0; download=0; total=0; expire={int((user or {}).get('expiry') or 0)}")
         self.end_headers()
         self.wfile.write(body)
 
@@ -3806,6 +5268,9 @@ def main():
     supervise("sub_watchdog", sub_watchdog_loop)
     supervise("cert_reload", cert_reload_loop)
     supervise("cert_renew", cert_renew_loop)
+    supervise("users", users_loop)
+    supervise("stats", stats_loop)
+    supervise("sysmon", sys_loop)
 
     # 订阅服务与面板同进程（省一个 Python 解释器约 20MB），由 supervisor 看着
     sub_port = int(pc.get("sub_port", 8080))
